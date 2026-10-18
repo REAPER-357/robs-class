@@ -1,0 +1,950 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rob's Class App</title>
+<meta name="description" content="Class quizzes with instant grading, deadlines and scores sent to Google Sheets.">
+<meta name="theme-color" content="#0b1020">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+
+<!-- ============================================================
+     SETTINGS YOU CAN EDIT  (change, then upload this file to GitHub)
+     ============================================================ -->
+<script>
+const CONFIG = {
+  APP_NAME: "Rob's Class App",
+
+  // Teacher password, stored as a hash (not readable). To change it:
+  //   1. Open this app with  #hash  on the end of the address, e.g.  https://yoursite/#hash
+  //   2. Type your new password, copy the hash it shows, paste it below.
+  TEACHER_PASSWORD_HASH: 'dec0bd5639a5d26b2e7919543caf5cad17791abc42cb31775071b191b7108fd7',
+  HASH_SALT: 'robs-class-app',   // if you change these two, regenerate the hash
+  HASH_ROUNDS: 20000,
+
+  // Optional: your Google Apps Script web app URL, so students never need it in the link.
+  WEBHOOK_URL: '',
+
+  // Big picture on the main page. Use 'icon.png' or 'logo.png' (or any file in the same folder).
+  HERO_IMAGE: 'logo.png',
+  SHOW_TITLE_UNDER_IMAGE: true
+};
+</script>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: { extend: { colors: {
+    bg: 'rgb(var(--bg) / <alpha-value>)', card: 'rgb(var(--card) / <alpha-value>)', sunk: 'rgb(var(--sunk) / <alpha-value>)',
+    line: 'rgb(var(--line) / <alpha-value>)', ink: 'rgb(var(--ink) / <alpha-value>)', mute: 'rgb(var(--mute) / <alpha-value>)',
+    faint: 'rgb(var(--faint) / <alpha-value>)', accent: 'rgb(var(--accent) / <alpha-value>)', 'accent-ink': 'rgb(var(--accent-ink) / <alpha-value>)',
+    'accent-text': 'rgb(var(--accent-text) / <alpha-value>)', good: 'rgb(var(--good) / <alpha-value>)', bad: 'rgb(var(--bad) / <alpha-value>)', warn: 'rgb(var(--warn) / <alpha-value>)'
+  } } }
+};
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<!-- Theme (runs before the page paints so there is no flash) -->
+<script>
+const MODES = {
+  black: { bg: '0 0 0', card: '14 14 17', sunk: '0 0 0', line: '42 42 50', ink: '244 244 245', mute: '161 161 170', faint: '113 113 122', good: '52 211 153', bad: '251 113 133', warn: '251 191 36', scheme: 'dark', label: 'Black' },
+  dark:  { bg: '11 16 32', card: '19 26 46', sunk: '9 13 26', line: '38 48 74', ink: '232 236 246', mute: '154 166 192', faint: '102 114 143', good: '52 211 153', bad: '251 113 133', warn: '251 191 36', scheme: 'dark', label: 'Dark' },
+  light: { bg: '243 245 249', card: '255 255 255', sunk: '241 243 248', line: '218 223 234', ink: '17 24 39', mute: '75 85 99', faint: '107 114 128', good: '5 150 105', bad: '220 38 38', warn: '180 83 9', scheme: 'light', label: 'Light' }
+};
+const ACCENTS = { purple: '#8b5cf6', blue: '#3b82f6', green: '#22c55e', red: '#ef4444', pink: '#ec4899', orange: '#f97316', yellow: '#eab308', teal: '#14b8a6' };
+function hexToRgb(h) { h = h.replace('#', ''); if (h.length === 3) h = h.split('').map(c => c + c).join(''); const n = parseInt(h, 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255; const mx = Math.max(r, g, b), mn = Math.min(r, g, b); let h = 0, s = 0; const l = (mx + mn) / 2;
+  if (mx !== mn) { const d = mx - mn; s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn); h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; h /= 6; }
+  return [h, s, l];
+}
+function hslToRgb(h, s, l) {
+  if (s === 0) { const v = Math.round(l * 255); return [v, v, v]; }
+  const q = l < .5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+  const f = t => { t = (t + 1) % 1; return t < 1 / 6 ? p + (q - p) * 6 * t : t < .5 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p; };
+  return [Math.round(f(h + 1 / 3) * 255), Math.round(f(h) * 255), Math.round(f(h - 1 / 3) * 255)];
+}
+function getTheme() {
+  let t = {}; try { t = JSON.parse(localStorage.getItem('rca.theme') || '{}'); } catch {}
+  return { mode: MODES[t.mode] ? t.mode : 'dark', accent: /^#[0-9a-f]{6}$/i.test(t.accent || '') ? t.accent : ACCENTS.purple };
+}
+function applyTheme(t) {
+  const m = MODES[t.mode], root = document.documentElement.style;
+  ['bg', 'card', 'sunk', 'line', 'ink', 'mute', 'faint', 'good', 'bad', 'warn'].forEach(k => root.setProperty('--' + k, m[k]));
+  const [r, g, b] = hexToRgb(t.accent);
+  const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  const [h, s, l] = rgbToHsl(r, g, b);
+  const tx = hslToRgb(h, s, m.scheme === 'light' ? Math.min(l, .38) : Math.max(l, .68));
+  root.setProperty('--accent', r + ' ' + g + ' ' + b);
+  root.setProperty('--accent-ink', lum > .55 ? '17 24 39' : '255 255 255');
+  root.setProperty('--accent-text', tx.join(' '));
+  document.documentElement.style.colorScheme = m.scheme;
+  const meta = document.querySelector('meta[name=theme-color]'); if (meta) meta.content = 'rgb(' + m.bg.split(' ').join(',') + ')';
+}
+function saveTheme(t) { try { localStorage.setItem('rca.theme', JSON.stringify(t)); } catch {} applyTheme(t); }
+applyTheme(getTheme());
+</script>
+
+<style>
+  body { background: radial-gradient(1000px 520px at 50% -160px, rgb(var(--accent) / .16), transparent 62%), rgb(var(--bg)); color: rgb(var(--ink)); padding-bottom: env(safe-area-inset-bottom); }
+  .card { background: rgb(var(--card)); border: 1px solid rgb(var(--line)); border-radius: 1rem; padding: 1.25rem; box-shadow: 0 8px 24px rgb(0 0 0 / .16); }
+  @media (min-width: 640px) { .card { padding: 1.5rem; } }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; border-radius: .75rem; padding: .65rem 1rem; font-size: .875rem; font-weight: 600; transition: filter .15s, background .15s; cursor: pointer; border: 1px solid transparent; }
+  .btn:focus-visible, .input:focus-visible { outline: 2px solid rgb(var(--accent)); outline-offset: 2px; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-primary { background: rgb(var(--accent)); color: rgb(var(--accent-ink)); padding: .8rem 1.25rem; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.1); }
+  .btn-ghost { background: rgb(var(--sunk)); color: rgb(var(--ink)); border-color: rgb(var(--line)); }
+  .btn-ghost:hover:not(:disabled) { border-color: rgb(var(--accent)); }
+  .btn-danger { background: rgb(var(--bad) / .1); color: rgb(var(--bad)); border-color: rgb(var(--bad) / .35); }
+  .btn-big { flex-direction: column; padding: 1.25rem .75rem; font-size: 1.05rem; border-radius: 1rem; width: 100%; }
+  .input { width: 100%; border-radius: .75rem; background: rgb(var(--sunk)); border: 1px solid rgb(var(--line)); padding: .65rem 1rem; color: rgb(var(--ink)); }
+  .input::placeholder { color: rgb(var(--faint)); }
+  .input:focus { border-color: rgb(var(--accent)); outline: none; }
+  .label { display: block; font-size: .875rem; font-weight: 500; color: rgb(var(--mute)); margin-bottom: .375rem; }
+  .chip { display: inline-flex; align-items: center; gap: .375rem; border-radius: 999px; background: rgb(var(--sunk)); border: 1px solid rgb(var(--line)); padding: .2rem .7rem; font-size: .75rem; color: rgb(var(--mute)); }
+  .opt input:checked + .optbox { border-color: rgb(var(--accent)); background: rgb(var(--accent) / .12); }
+  .opt input:focus-visible + .optbox { outline: 2px solid rgb(var(--accent)); outline-offset: 2px; }
+  .optbox { display: flex; align-items: center; gap: .75rem; border-radius: .75rem; border: 1px solid rgb(var(--line)); background: rgb(var(--sunk)); padding: .75rem 1rem; transition: border-color .15s; }
+  .optbox:hover { border-color: rgb(var(--faint)); }
+  .noselect { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  details > summary { list-style: none; } details > summary::-webkit-details-marker { display: none; }
+  .swatch { width: 2.25rem; height: 2.25rem; border-radius: 999px; border: 2px solid transparent; cursor: pointer; }
+  .swatch.on { outline: 2px solid rgb(var(--ink)); outline-offset: 2px; }
+  .modebtn { border: 2px solid rgb(var(--line)); border-radius: .75rem; padding: .5rem; font-size: .8rem; font-weight: 600; cursor: pointer; background: rgb(var(--sunk)); color: rgb(var(--ink)); }
+  .modebtn.on { border-color: rgb(var(--accent)); }
+</style>
+</head>
+<body class="min-h-screen antialiased">
+
+<header id="hdr" class="hidden sticky top-0 z-30 border-b border-line bg-bg/80 backdrop-blur"></header>
+<main id="app" class="px-4 py-8 sm:py-10"></main>
+
+<script>
+'use strict';
+/* ---------- helpers ---------- */
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} }
+};
+const LETTERS = 'ABCDEFGH';
+const fmt = n => Number.isInteger(n) ? n : +n.toFixed(2);
+const fmtDur = s => { s = Math.round(s); return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's'; };
+const fmtDate = iso => new Date(iso).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function shuffle(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function toast(msg, type) {
+  const t = document.createElement('div');
+  t.className = 'fixed left-1/2 -translate-x-1/2 bottom-6 z-[60] max-w-[90vw] px-4 py-3 rounded-xl text-sm shadow-xl border bg-card ' + (type === 'error' ? 'border-bad text-bad' : 'border-line text-ink');
+  t.textContent = msg; document.body.appendChild(t); setTimeout(() => t.remove(), 4200);
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta); ta.select(); let ok = false; try { ok = document.execCommand('copy'); } catch {}
+    ta.remove(); return ok;
+  }
+}
+const badge = (txt, kind) => `<span class="chip font-semibold text-${kind}" style="border-color:rgb(var(--${kind}) / .4);background:rgb(var(--${kind}) / .1)">${esc(txt)}</span>`;
+const toLocalInput = iso => { if (!iso) return ''; const d = new Date(iso); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
+
+/* ---------- SHA-256 (pure JS, used for the teacher password hash) ---------- */
+const sha256 = (() => {
+  const P = []; for (let n = 2; P.length < 64; n++) { let ok = true; for (let d = 2; d * d <= n; d++) if (n % d === 0) { ok = false; break; } if (ok) P.push(n); }
+  const fr = x => Math.floor((x - Math.floor(x)) * 4294967296);
+  const K = new Uint32Array(P.map(p => fr(Math.cbrt(p))));
+  const H0 = new Uint32Array(P.slice(0, 8).map(p => fr(Math.sqrt(p))));
+  const ror = (x, n) => (x >>> n) | (x << (32 - n));
+  return function (msg) {
+    const l = msg.length, total = ((l + 9 + 63) >> 6) << 6;
+    const buf = new Uint8Array(total); buf.set(msg); buf[l] = 0x80;
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(total - 4, (l * 8) >>> 0); dv.setUint32(total - 8, Math.floor(l * 8 / 4294967296));
+    const h = new Uint32Array(H0), w = new Uint32Array(64);
+    for (let o = 0; o < total; o += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const a = w[i - 15], b = w[i - 2];
+        w[i] = w[i - 16] + (ror(a, 7) ^ ror(a, 18) ^ (a >>> 3)) + w[i - 7] + (ror(b, 17) ^ ror(b, 19) ^ (b >>> 10));
+      }
+      let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+      for (let i = 0; i < 64; i++) {
+        const t1 = (hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0;
+        const t2 = ((ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+        hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+    const out = new Uint8Array(32), ov = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i]);
+    return out;
+  };
+})();
+const toHex = u => Array.from(u, b => b.toString(16).padStart(2, '0')).join('');
+function hashPw(pw) {
+  let h = sha256(new TextEncoder().encode(CONFIG.HASH_SALT + ':' + pw));
+  for (let i = 0; i < CONFIG.HASH_ROUNDS; i++) h = sha256(h);
+  return toHex(h);
+}
+
+/* ---------- state ---------- */
+let quiz = LS.get('rca.quiz', null);   // {title, questions:[{q, options[], answer, points}]}
+let settings = Object.assign({ webhook: '', shuffleQ: false, shuffleO: false, showReview: false, minutes: 0, deadline: '', allowLate: true, blockCopy: true }, LS.get('rca.settings', {}));
+if (!settings.webhook) settings.webhook = CONFIG.WEBHOOK_URL || '';
+let results = LS.get('rca.results', []);
+let pending = LS.get('rca.pending', []);
+let view = 'home';
+let attempt = null;
+let lastReview = null;
+let lastWarnings = [];
+let unlocked = false;
+let timerId = null, beatId = null;
+let deferredInstall = null;
+let leaveStart = null;
+
+const saveSettings = () => LS.set('rca.settings', settings);
+const saveQuiz = () => LS.set('rca.quiz', quiz);
+const saveAttempt = () => { if (attempt) LS.set('rca.attempt', attempt); };
+const quizSig = () => quiz ? quiz.title + '|' + quiz.questions.length : '';
+const dlTime = () => settings.deadline ? new Date(settings.deadline).getTime() : 0;
+const isPast = () => dlTime() && Date.now() > dlTime();
+const isClosed = () => isPast() && !settings.allowLate;
+
+/* ---------- Excel parsing ---------- */
+function resolveAnswer(raw, list) {
+  if (!raw) return { k: -1 };
+  const lower = raw.toLowerCase();
+  const byText = list.findIndex(o => o.text.toLowerCase() === lower);
+  let byPos = -1;
+  const m = raw.match(/^(?:option|choice|opt)?[\s_.\-]*([a-h]|[1-8])[.)]?$/i);
+  if (m) {
+    const ch = m[1].toLowerCase();
+    const pos = /\d/.test(ch) ? parseInt(ch, 10) - 1 : ch.charCodeAt(0) - 97;
+    byPos = list.findIndex(o => o.pos === pos);
+  }
+  // the option's own text wins (so Answer "4" matches an option reading "4"); otherwise treat it as a letter/number
+  if (byText >= 0) return { k: byText, amb: byPos >= 0 && byPos !== byText };
+  return { k: byPos };
+}
+function parseWorkbook(buf) {
+  const wb = XLSX.read(buf, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  if (rows.length < 2) throw new Error('The sheet needs a header row plus at least one question.');
+  const head = rows[0].map(h => String(h).trim().toLowerCase());
+  const qCol = head.findIndex(h => /^q(uestion)?s?\b/.test(h));
+  const aCol = head.findIndex(h => /^(correct|answer|key|ans)\b/.test(h));
+  const pCol = head.findIndex(h => /^(points?|marks?)\b/.test(h));
+  const optCols = [];
+  head.forEach((h, i) => { if (i !== qCol && i !== aCol && i !== pCol && /^(?:option|choice|opt)?[\s_.\-]*([a-h]|[1-8])$/.test(h)) optCols.push(i); });
+  if (qCol < 0) throw new Error('Could not find a "Question" column in row 1.');
+  if (aCol < 0) throw new Error('Could not find an "Answer" column in row 1.');
+  if (optCols.length < 2) throw new Error('Need at least two option columns (e.g. "Option A", "Option B").');
+  const questions = [], warnings = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const text = String(r[qCol] ?? '').trim();
+    if (!text) continue;
+    const list = [];
+    optCols.forEach((c, pos) => { const t = String(r[c] ?? '').trim(); if (t) list.push({ text: t, pos }); });
+    if (list.length < 2) { warnings.push(`Row ${i + 1}: needs at least 2 options, skipped.`); continue; }
+    const raw = String(r[aCol] ?? '').trim();
+    const { k, amb } = resolveAnswer(raw, list);
+    if (k < 0) { warnings.push(`Row ${i + 1}: answer "${raw}" doesn't match any option, skipped.`); continue; }
+    if (amb) warnings.push(`Row ${i + 1}: answer "${raw}" matches an option's text and also an option position. Used the option text "${list[k].text}". Use a letter (A, B, C…) if you meant the position.`);
+    let pts = pCol >= 0 ? parseFloat(r[pCol]) : 1;
+    if (!(pts > 0)) pts = 1;
+    questions.push({ q: text, options: list.map(o => o.text), answer: k, points: pts });
+  }
+  return { questions, warnings };
+}
+async function handleFile(f) {
+  if (!f) return;
+  try {
+    const { questions, warnings } = parseWorkbook(await f.arrayBuffer());
+    if (!questions.length) throw new Error('No valid questions found. ' + (warnings[0] || ''));
+    quiz = { title: f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim() || 'Quiz', questions };
+    saveQuiz(); lastWarnings = warnings;
+    toast(`Loaded ${questions.length} question${questions.length > 1 ? 's' : ''}` + (warnings.length ? ` (${warnings.length} note${warnings.length > 1 ? 's' : ''}, see below)` : ''));
+    render();
+  } catch (err) { toast(err.message || 'Could not read that file.', 'error'); }
+}
+function downloadTemplate() {
+  const aoa = [
+    ['Question', 'Option A', 'Option B', 'Option C', 'Option D', 'Answer', 'Points'],
+    ['What is the capital of France?', 'Berlin', 'Paris', 'Madrid', 'Rome', 'B', 1],
+    ['2 + 2 = ?', '3', '4', '5', '22', 'B', 1],
+    ['The Earth orbits the Sun.', 'True', 'False', '', '', 'A', 1]
+  ];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [{ wch: 44 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 9 }, { wch: 8 }];
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Quiz');
+  XLSX.writeFile(wb, 'quiz-template.xlsx');
+}
+function exportResults() {
+  const a1 = [['Timestamp', 'Name', 'Quiz', 'Score', 'Total', 'Percent', 'Late', 'Flags', 'Seconds', 'Sent to sheet']];
+  const a2 = [['Name', 'Quiz', '#', 'Question', 'Student answer', 'Correct answer', 'Correct?', 'Points']];
+  results.slice().reverse().forEach(r => {
+    a1.push([new Date(r.timestamp).toLocaleString(), r.name, r.quiz, r.score, r.total, r.percent, r.late ? 'LATE' : '', r.integrity && r.integrity.flagged ? r.integrity.summary : '', r.seconds, r.sent ? 'yes' : 'no']);
+    (r.answers || []).forEach(a => a2.push([r.name, r.quiz, a.n, a.q, a.chosen, a.correctAnswer, a.ok ? 'YES' : 'NO', a.earned]));
+  });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(a1), 'Results');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(a2), 'Answers');
+  XLSX.writeFile(wb, 'class-results.xlsx');
+}
+
+/* ---------- share link (quiz encoded in URL hash) ---------- */
+const b64url = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+const unb64url = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const b = atob(s); const u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
+async function encodePayload(obj) {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  if ('CompressionStream' in window) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+    return 'z' + b64url(new Uint8Array(await new Response(stream).arrayBuffer()));
+  }
+  return 'p' + b64url(bytes);
+}
+async function decodePayload(s) {
+  const bytes = unb64url(s.slice(1));
+  if (s[0] === 'z') {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return JSON.parse(new TextDecoder().decode(await new Response(stream).arrayBuffer()));
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+async function copyLink() {
+  if (!quiz) return toast('Upload a quiz first.', 'error');
+  const payload = { v: 2, t: quiz.title, w: settings.webhook, o: { sq: settings.shuffleQ, so: settings.shuffleO, rv: settings.showReview, m: settings.minutes, dl: settings.deadline, late: settings.allowLate, bc: settings.blockCopy }, q: quiz.questions.map(q => [q.q, q.options, q.answer, q.points]) };
+  const url = location.href.split('#')[0] + '#q=' + await encodePayload(payload);
+  const ok = await copyText(url);
+  toast(ok ? `Student link copied (${url.length.toLocaleString()} characters)` : 'Could not copy the link.', ok ? '' : 'error');
+  if (ok && url.length > 7000) setTimeout(() => toast('Long link: some chat apps may cut it off. Test it before sharing.'), 4300);
+}
+async function loadFromHash() {
+  const m = location.hash.match(/^#q=(.+)$/);
+  if (!m) return;
+  try {
+    const p = await decodePayload(m[1]);
+    const qs = p.q.map(([q, options, answer, points]) => ({ q: String(q), options: options.map(String), answer: +answer, points: +points > 0 ? +points : 1 }));
+    if (!qs.length || qs.some(q => q.options.length < 2 || !(q.answer >= 0 && q.answer < q.options.length))) throw new Error('bad');
+    quiz = { title: String(p.t || 'Quiz'), questions: qs };
+    if (p.w) settings.webhook = String(p.w);
+    if (p.o) Object.assign(settings, { shuffleQ: !!p.o.sq, shuffleO: !!p.o.so, showReview: !!p.o.rv, minutes: +p.o.m || 0, deadline: p.o.dl ? String(p.o.dl) : '', allowLate: p.o.late !== false, blockCopy: p.o.bc !== false });
+    saveQuiz(); saveSettings();
+    history.replaceState(null, '', location.pathname + location.search);
+    toast('Quiz loaded: ' + quiz.title);
+  } catch { toast('That quiz link looks damaged.', 'error'); }
+}
+
+/* ---------- webhook ---------- */
+const payloadOf = r => ({ id: r.id, timestamp: r.timestamp, name: r.name, quiz: r.quiz, score: r.score, total: r.total, percent: r.percent, correct: r.correct, questions: r.questions, seconds: r.seconds, late: !!r.late, deadline: r.deadline || '', integrity: r.integrity || null, log: r.log || [], answers: r.answers || [] });
+async function sendResult(rec) {
+  if (!settings.webhook) return 'nohook';
+  try {
+    await fetch(settings.webhook, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payloadOf(rec)) });
+    return 'sent';
+  } catch { return 'failed'; }
+}
+async function deliver(rec) {
+  setStatus('sending');
+  const r = await sendResult(rec);
+  if (r === 'sent') { rec.sent = true; pending = pending.filter(p => p.id !== rec.id); }
+  else if (r === 'failed' && !pending.some(p => p.id === rec.id)) pending.push(rec);
+  LS.set('rca.results', results); LS.set('rca.pending', pending);
+  setStatus(r);
+}
+async function retryPending() {
+  if (!settings.webhook || !pending.length) return;
+  for (const rec of pending.slice()) {
+    const r = await sendResult(rec);
+    if (r === 'sent') { pending = pending.filter(p => p.id !== rec.id); const row = results.find(x => x.id === rec.id); if (row) row.sent = true; }
+  }
+  LS.set('rca.results', results); LS.set('rca.pending', pending);
+  if (['home', 'teacher', 'studentStart'].includes(view)) render();
+}
+function setStatus(state) {
+  const el = $('#sendStatus'); if (!el) return;
+  const map = {
+    sending: ['text-mute', 'Sending your score…'],
+    sent: ['text-good', '✓ Your score and answers were sent to your teacher.'],
+    nohook: ['text-warn', 'Your score is saved on this device. No Google Sheet is connected yet.'],
+    failed: ['text-warn', "Couldn't send right now. Your score is saved and will retry automatically."]
+  };
+  const [cls, txt] = map[state];
+  el.className = 'mt-6 text-sm ' + cls;
+  el.innerHTML = esc(txt) + (state === 'failed' ? ' <button data-act="retryNow" class="underline font-semibold">Retry now</button>' : '');
+}
+
+/* ---------- Google Apps Script (paste into the Sheet) ---------- */
+const APPS_SCRIPT = `function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var d = JSON.parse(e.postData.contents);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var res = sheet_(ss, 'Results', ['Timestamp','Name','Quiz','Score','Total','Percent','Late','Flags','Seconds','ID']);
+    var n = res.getLastRow();
+    var ids = n > 1 ? res.getRange(2, 10, n - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
+    if (ids.indexOf(d.id) !== -1) return ContentService.createTextOutput('duplicate');
+
+    var flags = (d.integrity && d.integrity.flagged) ? d.integrity.summary : '';
+    res.appendRow([new Date(d.timestamp), safe_(d.name), safe_(d.quiz), d.score, d.total, d.percent, d.late ? 'LATE' : '', safe_(flags), d.seconds, d.id]);
+    var r = res.getLastRow();
+    if (flags) res.getRange(r, 1, 1, 10).setBackground('#fde2e2');
+    else if (d.late) res.getRange(r, 1, 1, 10).setBackground('#fff4cc');
+
+    var rows = (d.answers || []).map(function (a) {
+      return [d.id, safe_(d.name), safe_(d.quiz), a.n, safe_(a.q), safe_(a.chosen), safe_(a.correctAnswer), a.ok ? 'YES' : 'NO', a.earned];
+    });
+    append_(sheet_(ss, 'Answers', ['ID','Name','Quiz','#','Question','Student answer','Correct answer','Correct?','Points']), rows);
+
+    var log = (d.log || []).map(function (l) {
+      return [d.id, safe_(d.name), safe_(d.quiz), l.t, safe_(l.type), safe_(l.detail)];
+    });
+    append_(sheet_(ss, 'Activity log', ['ID','Name','Quiz','Seconds into quiz','Event','Detail']), log);
+    return ContentService.createTextOutput('ok');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function doGet() {
+  return ContentService.createTextOutput("Rob's Class App webhook is live");
+}
+
+function sheet_(ss, name, headers) {
+  var sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(headers);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  }
+  return sh;
+}
+
+function append_(sh, rows) {
+  if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+// Stops names/answers that start with = + - @ from running as spreadsheet formulas
+function safe_(v) {
+  v = (v === null || v === undefined) ? '' : String(v);
+  return ['=', '+', '-', '@'].indexOf(v.charAt(0)) !== -1 ? "'" + v : v;
+}`;
+
+/* ---------- integrity tracking ---------- */
+const newStats = () => ({ leaves: 0, awayMs: 0, copies: 0, pastes: 0, menus: 0, prints: 0, resumes: 0 });
+const tracking = () => view === 'quiz' && attempt && !attempt.done;
+function ev(type, detail) {
+  if (!attempt || attempt.done) return;
+  if (attempt.log.length < 300) attempt.log.push({ t: Math.round((Date.now() - attempt.startedAt) / 1000), type, detail: detail || '' });
+  saveAttempt();
+}
+function onLeave(why) {
+  if (!tracking() || leaveStart) return;
+  leaveStart = Date.now(); attempt.stats.leaves++; ev('left page', why);
+}
+function onReturn() {
+  if (!tracking() || !leaveStart) return;
+  const d = Date.now() - leaveStart; leaveStart = null;
+  attempt.stats.awayMs += d; ev('came back', 'away ' + fmtDur(d / 1000));
+}
+function resumeAttempt() {
+  const away = Date.now() - (attempt.lastSeen || Date.now());
+  if (away > 6000) {
+    attempt.stats.leaves++; attempt.stats.resumes++; attempt.stats.awayMs += away;
+    ev('closed or left quiz, then resumed', 'away ' + fmtDur(away / 1000));
+  }
+  attempt.lastSeen = Date.now(); saveAttempt();
+}
+function integrityOf(a, seconds) {
+  const s = a.stats, parts = [];
+  if (s.leaves) parts.push(`Left the page ${s.leaves}× (${fmtDur(s.awayMs / 1000)} away)`);
+  if (s.copies) parts.push(`copy/cut attempt ${s.copies}×`);
+  if (s.pastes) parts.push(`paste ${s.pastes}×`);
+  if (s.prints) parts.push(`print/save/screenshot key ${s.prints}×`);
+  if (s.resumes) parts.push(`closed or reloaded and resumed ${s.resumes}×`);
+  const n = a.order.length, fast = n >= 5 && seconds / n < 2.5;
+  if (fast) parts.push(`finished unusually fast (${fmtDur(seconds)} for ${n} questions)`);
+  const minor = s.menus ? `right-click ${s.menus}×` : '';
+  return { flagged: parts.length > 0, summary: (parts.concat(minor ? [minor] : [])).join('; ') || 'No issues detected', leaves: s.leaves, awaySeconds: Math.round(s.awayMs / 1000), copies: s.copies, pastes: s.pastes, prints: s.prints, rightClicks: s.menus, resumes: s.resumes, fast };
+}
+function installGuards() {
+  document.addEventListener('visibilitychange', () => document.hidden ? onLeave('tab hidden or app switched') : onReturn());
+  window.addEventListener('blur', () => onLeave('window lost focus'));
+  window.addEventListener('focus', onReturn);
+  window.addEventListener('pagehide', () => { if (tracking()) { attempt.lastSeen = Date.now(); saveAttempt(); } });
+  ['copy', 'cut'].forEach(t => document.addEventListener(t, e => { if (!tracking()) return; attempt.stats.copies++; ev(t, 'tried to ' + t + ' text'); if (settings.blockCopy) e.preventDefault(); }));
+  document.addEventListener('paste', () => { if (!tracking()) return; attempt.stats.pastes++; ev('paste', 'pasted into the page'); });
+  document.addEventListener('contextmenu', e => { if (!tracking()) return; attempt.stats.menus++; ev('right-click', ''); if (settings.blockCopy) e.preventDefault(); });
+  window.addEventListener('beforeprint', () => { if (!tracking()) return; attempt.stats.prints++; ev('print', 'print dialog opened'); });
+  document.addEventListener('keydown', e => {
+    if (!tracking()) return;
+    const k = (e.key || '').toLowerCase(), mod = e.ctrlKey || e.metaKey;
+    if (k === 'printscreen' || (mod && (k === 'p' || k === 's')) || (e.metaKey && e.shiftKey && ['3', '4', '5'].includes(k))) { attempt.stats.prints++; ev('shortcut', (mod ? 'Ctrl/Cmd+' : '') + (e.key || '')); }
+  });
+}
+
+/* ---------- views ---------- */
+const ICON_GEAR = '<svg viewBox="0 0 24 24" class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
+const ICON_CAP = '<svg viewBox="0 0 24 24" class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10 12 5 2 10l10 5 10-5z"/><path d="M6 12v5c3 2.5 9 2.5 12 0v-5"/></svg>';
+const ICON_LOCK = '<svg viewBox="0 0 24 24" class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+
+function headerHTML() {
+  if (view === 'home') return '';
+  const right = view === 'quiz' ? '<button data-act="exitQuiz" class="btn btn-ghost">Exit</button>'
+    : view === 'teacher' ? '<button data-act="lock" class="btn btn-ghost">Lock &amp; exit</button>'
+    : '<button data-act="home" class="btn btn-ghost">← Home</button>';
+  return `<div class="max-w-5xl mx-auto px-4 h-14 flex items-center justify-between gap-3"><div class="font-bold tracking-tight truncate">${esc(CONFIG.APP_NAME)}</div>${right}</div>`;
+}
+
+function homeView() {
+  const hero = CONFIG.HERO_IMAGE ? `<img src="${esc(CONFIG.HERO_IMAGE)}" alt="${esc(CONFIG.APP_NAME)}" class="w-60 h-60 sm:w-80 sm:h-80 object-contain rounded-full" style="box-shadow:0 0 60px rgb(var(--accent) / .35)" onerror="this.style.display='none'">` : '';
+  return `<div class="min-h-[calc(100vh-5rem)] flex flex-col items-center justify-center text-center">
+    ${hero}
+    ${CONFIG.SHOW_TITLE_UNDER_IMAGE ? `<h1 class="mt-6 text-3xl sm:text-4xl font-extrabold tracking-tight">${esc(CONFIG.APP_NAME)}</h1>` : ''}
+    <p class="text-mute mt-2">Who's using the app?</p>
+    <div class="grid grid-cols-2 gap-4 mt-8 w-full max-w-md">
+      <button data-act="goStudent" class="btn btn-primary btn-big">${ICON_CAP}<span>Student</span></button>
+      <button data-act="goTeacher" class="btn btn-ghost btn-big"><span class="text-accent-text">${ICON_LOCK}</span><span>Teacher</span></button>
+    </div>
+    ${pending.length ? `<button data-act="retryNow" class="mt-6 text-sm text-warn underline">${pending.length} score${pending.length > 1 ? 's' : ''} waiting to send. Retry</button>` : ''}
+  </div>
+  <button data-act="openSettings" aria-label="Settings" title="Settings" class="fixed bottom-4 right-4 z-40 w-9 h-9 rounded-full grid place-items-center border border-line bg-card text-mute hover:text-ink opacity-80 hover:opacity-100 transition" style="margin-bottom:env(safe-area-inset-bottom)">${ICON_GEAR}</button>`;
+}
+
+function studentStartView() {
+  const saved = LS.get('rca.attempt', null);
+  const resume = saved && quiz && !saved.done && saved.sig === quizSig();
+  if (!quiz) return `<div class="max-w-xl mx-auto"><section class="card text-center"><h2 class="text-xl font-bold">No quiz yet</h2><p class="text-mute mt-2 text-sm">Ask your teacher for the quiz link and open it on this device.</p></section></div>`;
+  const total = quiz.questions.reduce((s, q) => s + q.points, 0);
+  const due = settings.deadline ? (isClosed() ? badge('Closed ' + fmtDate(settings.deadline), 'bad') : isPast() ? badge('Past due: will be marked LATE', 'warn') : `<span class="chip">Due ${esc(fmtDate(settings.deadline))}</span>`) : '';
+  return `<div class="max-w-xl mx-auto">
+    <div class="text-center mb-6"><h1 class="text-3xl font-extrabold tracking-tight">Student</h1></div>
+    <section class="card">
+      <div class="text-xs uppercase tracking-wider text-accent-text font-semibold">Quiz</div>
+      <h2 class="text-xl font-bold mt-1">${esc(quiz.title)}</h2>
+      <div class="flex flex-wrap gap-2 mt-3">
+        <span class="chip">${quiz.questions.length} questions</span><span class="chip">${fmt(total)} points</span>
+        ${settings.minutes ? `<span class="chip">⏱ ${settings.minutes} min</span>` : ''}${due}
+      </div>
+      <div class="mt-4 rounded-xl p-3 text-sm border border-warn/40 bg-warn/10 text-warn">
+        <b>Honest-work notice:</b> leaving this page, switching apps, copying text and similar activity is recorded and sent to your teacher with your answers.
+      </div>
+      ${resume ? `<div class="mt-5"><p class="text-sm text-mute mb-2">You have a quiz in progress as <b class="text-ink">${esc(saved.name)}</b>. The timer kept running.</p>
+        <button data-act="resume" class="btn btn-primary w-full">Continue quiz</button></div>` : `
+      <div class="mt-5"><label class="label" for="name">Your name</label>
+      <input id="name" class="input" maxlength="60" autocomplete="name" placeholder="First and last name" ${isClosed() ? 'disabled' : ''}>
+      <button data-act="start" class="btn btn-primary w-full mt-4" ${isClosed() ? 'disabled' : ''}>Start quiz</button></div>`}
+    </section></div>`;
+}
+
+function loginView() {
+  return `<div class="max-w-sm mx-auto"><section class="card">
+    <h2 class="text-lg font-bold">Teacher login</h2>
+    <p class="text-sm text-mute mt-1 mb-4">Enter the teacher password.</p>
+    <div class="relative"><input id="pwIn" type="password" class="input pr-16" placeholder="Password" autocomplete="current-password">
+    <button data-act="togglePw" type="button" class="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-mute underline px-2">Show</button></div>
+    <div id="loginMsg" class="text-sm text-bad mt-2 min-h-[1.25rem]"></div>
+    <button data-act="unlock" class="btn btn-primary w-full mt-2">Unlock</button>
+  </section></div>`;
+}
+
+function hashToolView() {
+  return `<div class="max-w-xl mx-auto"><section class="card">
+    <h2 class="text-lg font-bold">Password hash tool</h2>
+    <p class="text-sm text-mute mt-1 mb-4">Type the new teacher password. Copy the line below into <code>CONFIG</code> at the top of index.html, then upload the file to GitHub. Nothing is sent anywhere.</p>
+    <input id="hashIn" type="text" class="input" placeholder="New password" autocomplete="off">
+    <button data-act="makeHash" class="btn btn-primary w-full mt-3">Generate hash</button>
+    <pre id="hashOut" class="mt-4 rounded-xl bg-sunk border border-line p-3 text-xs overflow-x-auto whitespace-pre-wrap break-all text-mute">The hash will appear here.</pre>
+  </section></div>`;
+}
+
+function teacherView() {
+  const q = quiz;
+  const preview = q ? q.questions.map((x, i) => `
+    <li class="py-3 border-t border-line first:border-0">
+      <div class="font-medium text-sm"><span class="text-faint">${i + 1}.</span> ${esc(x.q)} <span class="text-xs text-faint">(${fmt(x.points)} pt)</span></div>
+      <ul class="mt-1.5 grid sm:grid-cols-2 gap-x-4 gap-y-0.5 text-sm">
+        ${x.options.map((o, j) => `<li class="${j === x.answer ? 'text-good font-semibold' : 'text-mute'}">${LETTERS[j]}. ${esc(o)}${j === x.answer ? ' ✓' : ''}</li>`).join('')}
+      </ul></li>`).join('') : '';
+  const resList = results.slice(0, 50).map(r => `
+    <details class="rounded-xl border border-line bg-sunk">
+      <summary class="cursor-pointer px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span class="font-semibold">${esc(r.name)}</span>
+        <span>${fmt(r.score)}/${fmt(r.total)} <span class="text-faint">(${r.percent}%)</span></span>
+        ${r.late ? badge('LATE', 'warn') : ''}${r.integrity && r.integrity.flagged ? badge('FLAGGED', 'bad') : ''}
+        <span class="ml-auto text-xs text-faint">${esc(new Date(r.timestamp).toLocaleString())} · ${r.sent ? '<span class="text-good">sent ✓</span>' : '<span class="text-warn">not sent</span>'}</span>
+      </summary>
+      <div class="px-4 pb-4 text-sm space-y-3">
+        <div class="text-mute"><b class="text-ink">Activity:</b> ${esc(r.integrity ? r.integrity.summary : 'n/a')} · took ${fmtDur(r.seconds || 0)}</div>
+        ${(r.answers || []).length ? `<ol class="space-y-1">${r.answers.map(a => `<li class="${a.ok ? 'text-good' : 'text-bad'}">${a.ok ? '✓' : '✗'} <span class="text-mute">${a.n}. ${esc(a.q)}</span><br><span class="pl-4">Answered: ${esc(a.chosen)}${a.ok ? '' : ' · Correct: ' + esc(a.correctAnswer)}</span></li>`).join('')}</ol>` : ''}
+        ${(r.log || []).length ? `<div><b>Event log</b><ul class="mt-1 text-xs text-mute font-mono">${r.log.map(l => `<li>${fmtDur(l.t)} · ${esc(l.type)} ${esc(l.detail)}</li>`).join('')}</ul></div>` : ''}
+      </div></details>`).join('');
+  const chk = (key, label, full) => `<label class="flex items-center gap-3 rounded-xl bg-sunk border border-line px-4 py-3 cursor-pointer ${full ? 'sm:col-span-2' : ''}"><input type="checkbox" data-set="${key}" class="w-4 h-4" style="accent-color:rgb(var(--accent))" ${settings[key] ? 'checked' : ''}> ${label}</label>`;
+  return `<div class="max-w-3xl mx-auto space-y-5">
+    <section class="card">
+      <div class="flex items-start justify-between gap-3 flex-wrap">
+        <div><h2 class="text-lg font-bold">1. Upload your quiz</h2>
+        <p class="text-sm text-mute mt-1">Excel (.xlsx, .xls) or CSV. Columns: <b class="text-ink">Question</b>, <b class="text-ink">Option A–H</b>, <b class="text-ink">Answer</b> (letter or text), optional <b class="text-ink">Points</b>.</p></div>
+        <button data-act="template" class="btn btn-ghost">Download template</button>
+      </div>
+      <label id="drop" for="file" class="mt-4 block cursor-pointer rounded-2xl border-2 border-dashed border-line hover:border-accent transition p-8 text-center">
+        <div class="font-semibold">Drop a spreadsheet here, or tap to choose</div>
+        <div class="text-xs text-faint mt-1">Only the first sheet is used.</div>
+      </label>
+      <input id="file" type="file" class="hidden" accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv">
+      ${lastWarnings.length ? `<div class="mt-4 rounded-xl border border-warn/40 bg-warn/10 p-3 text-sm text-warn"><b>${lastWarnings.length} note${lastWarnings.length > 1 ? 's' : ''} about your spreadsheet</b><ul class="list-disc ml-5 mt-1 space-y-0.5">${lastWarnings.slice(0, 8).map(w => `<li>${esc(w)}</li>`).join('')}${lastWarnings.length > 8 ? `<li>…and ${lastWarnings.length - 8} more</li>` : ''}</ul></div>` : ''}
+      ${q ? `<div class="mt-5">
+        <label class="label" for="title">Quiz title</label>
+        <input id="title" data-set="title" class="input" value="${esc(q.title)}" maxlength="80">
+        <details class="mt-4"><summary class="cursor-pointer text-sm text-accent-text font-semibold">Preview ${q.questions.length} questions</summary><ul class="mt-2">${preview}</ul></details>
+        <div class="mt-4"><button data-act="clearQuiz" class="btn btn-danger">Remove quiz</button></div>
+      </div>` : ''}
+    </section>
+
+    <section class="card">
+      <h2 class="text-lg font-bold">2. Deadline &amp; rules</h2>
+      <div class="mt-4 grid sm:grid-cols-2 gap-4">
+        <div><label class="label" for="deadline">Deadline (your local time)</label>
+          <div class="flex gap-2"><input id="deadline" data-set="deadline" type="datetime-local" class="input" value="${esc(toLocalInput(settings.deadline))}"><button data-act="clearDeadline" class="btn btn-ghost">Clear</button></div></div>
+        <div><label class="label" for="minutes">Time limit (minutes, 0 = none)</label><input id="minutes" data-set="minutes" type="number" min="0" max="300" class="input" value="${settings.minutes}"></div>
+      </div>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        ${chk('allowLate', 'Allow late submissions (marked LATE in your sheet)')}
+        ${chk('blockCopy', 'Block copying &amp; right-click on questions')}
+        ${chk('shuffleQ', 'Shuffle question order')}
+        ${chk('shuffleO', 'Shuffle answer options')}
+        ${chk('showReview', 'Show students the correct answers after they submit', true)}
+      </div>
+      <p class="text-xs text-faint mt-3">Activity tracking is always on: leaving the page, closing and resuming, copy/paste and print keys are logged and sent with the results. If late submissions are off, the quiz closes at the deadline.</p>
+    </section>
+
+    <section class="card">
+      <h2 class="text-lg font-bold">3. Connect Google Sheet</h2>
+      <p class="text-sm text-mute mt-1 mb-4">Paste the web app URL from your Google Apps Script. You can also hard-code it as <code>WEBHOOK_URL</code> in index.html.</p>
+      <label class="label" for="webhook">Webhook URL</label>
+      <input id="webhook" data-set="webhook" class="input font-mono text-sm" inputmode="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(settings.webhook)}">
+      <div class="mt-3"><button data-act="testHook" class="btn btn-ghost">Send test row</button></div>
+      <details class="mt-5">
+        <summary class="cursor-pointer text-sm text-accent-text font-semibold">How to set up the Google Sheet</summary>
+        <ol class="mt-3 list-decimal ml-5 space-y-1.5 text-sm text-mute">
+          <li>Create a new Google Sheet.</li>
+          <li>Open <b class="text-ink">Extensions → Apps Script</b>, delete the sample code and paste the script below.</li>
+          <li>Click <b class="text-ink">Deploy → New deployment → Web app</b>. Set <b class="text-ink">Execute as: Me</b> and <b class="text-ink">Who has access: Anyone</b>.</li>
+          <li>Authorize when asked, then copy the <b class="text-ink">Web app URL</b> into the box above.</li>
+          <li>Press <b class="text-ink">Send test row</b>. If you already had an older script, replace it and choose <b class="text-ink">Deploy → Manage deployments → Edit → New version</b>.</li>
+          <li>Three tabs are created for you: <b class="text-ink">Results</b> (flagged rows go red, late rows yellow), <b class="text-ink">Answers</b> (every answer) and <b class="text-ink">Activity log</b>.</li>
+        </ol>
+        <div class="relative mt-3">
+          <button data-act="copyScript" class="btn btn-ghost absolute top-2 right-2" style="padding:.35rem .75rem">Copy</button>
+          <pre class="bg-sunk border border-line rounded-xl p-4 pt-12 text-xs overflow-x-auto text-mute">${esc(APPS_SCRIPT)}</pre>
+        </div>
+      </details>
+    </section>
+
+    <section class="card">
+      <h2 class="text-lg font-bold">4. Share with students</h2>
+      <p class="text-sm text-mute mt-1">Copies a link that contains the quiz, deadline and rules. Students open it on their own device and tap <b class="text-ink">Student</b>. Re-copy the link after changing anything above.</p>
+      <div class="mt-3"><button data-act="copyLink" class="btn btn-primary" ${q ? '' : 'disabled'}>Copy student link</button></div>
+      <p class="text-xs text-faint mt-3">The answers travel inside the link, so a determined student could decode them.</p>
+    </section>
+
+    <section class="card">
+      <div class="flex items-center justify-between gap-3 flex-wrap">
+        <h2 class="text-lg font-bold">Results on this device <span class="text-faint font-normal text-sm">(${results.length})</span></h2>
+        <div class="flex gap-2"><button data-act="exportResults" class="btn btn-ghost" ${results.length ? '' : 'disabled'}>Export Excel</button><button data-act="clearResults" class="btn btn-danger" ${results.length ? '' : 'disabled'}>Clear</button></div>
+      </div>
+      <p class="text-xs text-faint mt-1">Only attempts made on this device appear here. Your Google Sheet collects everyone's.</p>
+      ${results.length ? `<div class="mt-3 space-y-2">${resList}</div>` : '<p class="text-sm text-faint mt-3">No submissions yet.</p>'}
+      ${pending.length ? `<div class="mt-3 text-sm text-warn">${pending.length} waiting to send. <button data-act="retryNow" class="underline font-semibold">Retry now</button></div>` : ''}
+    </section>
+  </div>`;
+}
+
+function quizView() {
+  const cards = attempt.order.map(({ qi, o }, n) => {
+    const q = quiz.questions[qi];
+    return `<section class="card">
+      <div class="flex gap-3">
+        <div class="shrink-0 w-8 h-8 rounded-lg bg-sunk border border-line grid place-items-center text-sm font-bold text-accent-text">${n + 1}</div>
+        <h3 class="font-semibold text-lg leading-snug pt-0.5">${esc(q.q)}</h3>
+      </div>
+      <div class="mt-4 space-y-2.5">
+        ${o.map((oi, d) => `
+          <label class="block cursor-pointer opt">
+            <input type="radio" class="sr-only" name="q${qi}" data-q="${qi}" value="${oi}" ${attempt.answers[qi] === oi ? 'checked' : ''}>
+            <div class="optbox">
+              <span class="shrink-0 w-7 h-7 rounded-full border border-line grid place-items-center text-xs font-bold text-mute">${LETTERS[d]}</span>
+              <span class="text-[15px]">${esc(q.options[oi])}</span>
+            </div></label>`).join('')}
+      </div></section>`;
+  }).join('');
+  return `<div class="-mx-4 -mt-8 sm:-mt-10 px-4 py-3 sticky top-14 z-20 bg-bg/90 backdrop-blur border-b border-line">
+      <div class="max-w-3xl mx-auto">
+        <div class="flex items-center justify-between text-sm gap-3"><div class="truncate"><span class="text-faint">Student</span> <b>${esc(attempt.name)}</b></div><div id="timer" class="font-mono"></div></div>
+        <div class="mt-2 h-2 rounded-full bg-sunk border border-line overflow-hidden"><div id="bar" class="h-full bg-accent transition-all duration-300" style="width:0%"></div></div>
+        <div id="progressText" class="mt-1 text-xs text-mute"></div>
+      </div></div>
+    <div class="max-w-3xl mx-auto mt-6 space-y-5 ${settings.blockCopy ? 'noselect' : ''}">
+      <h1 class="text-2xl font-extrabold tracking-tight">${esc(quiz.title)}</h1>
+      ${cards}
+      <button data-act="submit" class="btn btn-primary w-full" style="padding:1rem;font-size:1rem">Submit answers</button>
+    </div>`;
+}
+
+function resultView() {
+  const r = lastReview.rec;
+  const col = r.percent >= 80 ? 'good' : r.percent >= 50 ? 'warn' : 'bad';
+  const C = 2 * Math.PI * 52;
+  const msg = r.percent >= 90 ? 'Outstanding!' : r.percent >= 75 ? 'Great work!' : r.percent >= 50 ? 'Good effort. Keep practising.' : 'Keep going. Review and try again.';
+  const review = settings.showReview ? lastReview.order.map(({ qi }, n) => {
+    const q = quiz.questions[qi]; const given = lastReview.answers[qi]; const ok = given === q.answer;
+    return `<li class="rounded-xl border ${ok ? 'border-good/40 bg-good/5' : 'border-bad/40 bg-bad/5'} p-4">
+      <div class="font-medium text-sm"><span class="text-faint">${n + 1}.</span> ${esc(q.q)}</div>
+      <div class="mt-2 text-sm ${ok ? 'text-good' : 'text-bad'}">${ok ? '✓' : '✗'} Your answer: ${given === undefined ? '<i>no answer</i>' : esc(q.options[given])}</div>
+      ${ok ? '' : `<div class="mt-1 text-sm text-good">Correct answer: ${esc(q.options[q.answer])}</div>`}
+    </li>`;
+  }).join('') : '';
+  return `<div class="max-w-2xl mx-auto">
+    <section class="card text-center">
+      <div class="text-sm text-mute">${esc(r.name)}</div>
+      <div class="relative w-40 h-40 mx-auto mt-3">
+        <svg viewBox="0 0 120 120" class="w-40 h-40 -rotate-90"><circle cx="60" cy="60" r="52" fill="none" stroke="rgb(var(--line))" stroke-width="10"/><circle cx="60" cy="60" r="52" fill="none" stroke="rgb(var(--${col}))" stroke-width="10" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - r.percent / 100)}"/></svg>
+        <div class="absolute inset-0 grid place-items-center"><div class="text-4xl font-extrabold">${r.percent}%</div></div>
+      </div>
+      <div class="mt-4 text-2xl font-bold">${fmt(r.score)} / ${fmt(r.total)} points</div>
+      <div class="text-mute mt-1">${r.correct} of ${r.questions} correct</div>
+      <div class="mt-3 font-semibold text-${col}">${msg}</div>
+      ${r.late ? `<div class="mt-3">${badge('Submitted after the deadline (LATE)', 'warn')}</div>` : ''}
+      ${r.integrity && r.integrity.flagged ? `<div class="mt-4 rounded-xl border border-warn/40 bg-warn/10 text-warn text-sm p-3 text-left"><b>Noted for your teacher:</b> ${esc(r.integrity.summary)}</div>` : ''}
+      <div id="sendStatus"></div>
+      <button data-act="home" class="btn btn-primary mt-6">Done</button>
+    </section>
+    ${review ? `<h2 class="mt-8 mb-3 text-lg font-bold">Review</h2><ul class="space-y-3">${review}</ul>` : ''}
+  </div>`;
+}
+
+/* ---------- settings (theme) modal ---------- */
+function openSettings() { if ($('#settingsOv')) return; const ov = document.createElement('div'); ov.id = 'settingsOv'; ov.className = 'fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-4'; document.body.appendChild(ov); renderSettings(); }
+function closeSettings() { const o = $('#settingsOv'); if (o) o.remove(); }
+function renderSettings() {
+  const ov = $('#settingsOv'); if (!ov) return;
+  const t = getTheme();
+  const modePrev = { black: '#000', dark: '#131a2e', light: '#ffffff' };
+  const isPreset = Object.values(ACCENTS).includes(t.accent.toLowerCase());
+  ov.innerHTML = `<div class="card w-full max-w-sm" role="dialog" aria-label="Settings">
+    <div class="flex items-center justify-between"><h2 class="text-lg font-bold">Settings</h2><button data-act="closeSettings" class="btn btn-ghost" style="padding:.3rem .7rem">Close</button></div>
+    <div class="label mt-5">Theme</div>
+    <div class="grid grid-cols-3 gap-2">${Object.keys(MODES).map(k => `<button data-act="setMode" data-v="${k}" class="modebtn ${t.mode === k ? 'on' : ''}"><span class="block h-8 rounded-lg mb-1.5 border border-line" style="background:${modePrev[k]}"></span>${MODES[k].label}</button>`).join('')}</div>
+    <div class="label mt-5">Accent colour</div>
+    <div class="flex flex-wrap gap-3">${Object.entries(ACCENTS).map(([n, c]) => `<button data-act="setAccent" data-v="${c}" aria-label="${n}" title="${n}" class="swatch ${t.accent.toLowerCase() === c ? 'on' : ''}" style="background:${c}"></button>`).join('')}
+      <label class="swatch ${isPreset ? '' : 'on'} relative overflow-hidden grid place-items-center text-xs font-bold" style="background:conic-gradient(red,yellow,lime,aqua,blue,magenta,red)" title="Custom colour"><input type="color" data-set="customAccent" value="${t.accent}" class="absolute inset-0 opacity-0 cursor-pointer w-full h-full"></label></div>
+    <p class="text-xs text-faint mt-4">Saved on this device only.</p>
+  </div>`;
+}
+
+/* ---------- quiz flow ---------- */
+function startAttempt(name) {
+  if (isClosed()) return toast('This quiz is closed.', 'error');
+  const idx = quiz.questions.map((_, i) => i);
+  if (settings.shuffleQ) shuffle(idx);
+  const order = idx.map(qi => { const o = quiz.questions[qi].options.map((_, i) => i); if (settings.shuffleO) shuffle(o); return { qi, o }; });
+  attempt = { name, order, answers: {}, startedAt: Date.now(), lastSeen: Date.now(), sig: quizSig(), done: false, stats: newStats(), log: [] };
+  attempt.log.push({ t: 0, type: 'started', detail: navigator.userAgent.slice(0, 120) });
+  saveAttempt(); leaveStart = null; view = 'quiz'; render();
+}
+function updateProgress() {
+  if (!attempt) return;
+  const total = attempt.order.length, n = Object.keys(attempt.answers).length;
+  const bar = $('#bar'), txt = $('#progressText');
+  if (bar) bar.style.width = (n / total * 100) + '%';
+  if (txt) txt.textContent = `${n} of ${total} answered`;
+}
+function endTime() {
+  let end = Infinity;
+  if (settings.minutes) end = attempt.startedAt + settings.minutes * 60000;
+  if (dlTime() && !settings.allowLate) end = Math.min(end, dlTime());
+  return end;
+}
+function startTimer() {
+  clearInterval(timerId);
+  const el = $('#timer'); if (!el) return;
+  const end = endTime();
+  const tick = () => {
+    if (!attempt) return clearInterval(timerId);
+    if (end === Infinity) { el.textContent = dlTime() ? (isPast() ? 'LATE' : 'Due ' + fmtDate(settings.deadline)) : ''; el.className = 'font-mono ' + (isPast() ? 'text-warn' : 'text-mute'); return; }
+    const left = Math.max(0, end - Date.now());
+    el.textContent = '⏱ ' + Math.floor(left / 60000) + ':' + String(Math.floor(left % 60000 / 1000)).padStart(2, '0');
+    el.className = 'font-mono ' + (left < 60000 ? 'text-bad' : '');
+    if (left <= 0) { clearInterval(timerId); toast("Time's up. Submitting your answers."); submitQuiz(true); }
+  };
+  tick(); timerId = setInterval(tick, 500);
+}
+function startBeat() { clearInterval(beatId); beatId = setInterval(() => { if (tracking()) { attempt.lastSeen = Date.now(); saveAttempt(); } }, 2000); }
+function submitQuiz(auto) {
+  if (!attempt || attempt.done) return;
+  const unanswered = attempt.order.length - Object.keys(attempt.answers).length;
+  if (!auto && unanswered > 0 && !confirm(`You have ${unanswered} unanswered question${unanswered > 1 ? 's' : ''}. Submit anyway?`)) return;
+  onReturn();
+  const seconds = Math.round((Date.now() - attempt.startedAt) / 1000);
+  const late = !!(dlTime() && Date.now() > dlTime() + 1000);
+  let score = 0, total = 0, correct = 0;
+  const answers = [];
+  attempt.order.forEach(({ qi }) => {
+    const q = quiz.questions[qi]; total += q.points;
+    const g = attempt.answers[qi], ok = g === q.answer;
+    if (ok) { score += q.points; correct++; }
+    answers.push({ n: qi + 1, q: q.q, chosen: g === undefined ? '(no answer)' : q.options[g], correctAnswer: q.options[q.answer], ok, points: q.points, earned: ok ? q.points : 0 });
+  });
+  answers.sort((a, b) => a.n - b.n);
+  ev('submitted', auto ? 'auto-submitted (time up)' : '');
+  attempt.done = true; clearInterval(timerId); clearInterval(beatId);
+  const integrity = integrityOf(attempt, seconds);
+  const rec = {
+    id: uid(), timestamp: new Date().toISOString(), name: attempt.name, quiz: quiz.title,
+    score: +score.toFixed(2), total: +total.toFixed(2), percent: total ? Math.round(score / total * 100) : 0,
+    correct, questions: attempt.order.length, seconds, late, deadline: settings.deadline || '', integrity, log: attempt.log, answers, sent: false
+  };
+  results.unshift(rec); LS.set('rca.results', results);
+  lastReview = { order: attempt.order, answers: attempt.answers, rec };
+  LS.del('rca.attempt');
+  attempt = null; view = 'result'; render(); deliver(rec);
+}
+
+/* ---------- teacher login ---------- */
+function lockInfo() { const f = LS.get('rca.fails', { n: 0, until: 0 }); return f; }
+function doUnlock() {
+  const msg = $('#loginMsg'), pw = $('#pwIn').value;
+  const f = lockInfo();
+  if (Date.now() < f.until) { msg.textContent = `Too many attempts. Try again in ${Math.ceil((f.until - Date.now()) / 1000)}s.`; return; }
+  if (!pw) { msg.textContent = 'Enter the password.'; return; }
+  msg.textContent = 'Checking…';
+  setTimeout(() => {
+    if (hashPw(pw) === CONFIG.TEACHER_PASSWORD_HASH) { LS.del('rca.fails'); unlocked = true; view = 'teacher'; render(); }
+    else {
+      const n = f.n + 1, wait = n >= 3 ? Math.min(300, 10 * Math.pow(2, n - 3)) : 0;
+      LS.set('rca.fails', { n, until: wait ? Date.now() + wait * 1000 : 0 });
+      msg.textContent = wait ? `Wrong password. Locked for ${wait}s.` : 'Wrong password.';
+      $('#pwIn').value = '';
+    }
+  }, 30);
+}
+
+/* ---------- render + events ---------- */
+function render() {
+  clearInterval(timerId); clearInterval(beatId);
+  if (view === 'teacher' && !unlocked) view = 'teacherLogin';
+  const views = { home: homeView, studentStart: studentStartView, teacherLogin: loginView, hashtool: hashToolView, teacher: teacherView, quiz: quizView, result: resultView };
+  const h = $('#hdr'); const hh = headerHTML(); h.innerHTML = hh; h.classList.toggle('hidden', !hh);
+  $('#app').innerHTML = views[view]();
+  window.scrollTo(0, 0);
+  if (view === 'quiz') { updateProgress(); startTimer(); startBeat(); }
+  if (view === 'teacherLogin') { const p = $('#pwIn'); if (p) p.focus(); }
+}
+
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  const act = b.dataset.act;
+  switch (act) {
+    case 'home': view = 'home'; render(); break;
+    case 'goStudent': view = 'studentStart'; render(); break;
+    case 'goTeacher': view = unlocked ? 'teacher' : 'teacherLogin'; render(); break;
+    case 'unlock': doUnlock(); break;
+    case 'togglePw': { const p = $('#pwIn'); p.type = p.type === 'password' ? 'text' : 'password'; b.textContent = p.type === 'password' ? 'Show' : 'Hide'; break; }
+    case 'lock': unlocked = false; view = 'home'; render(); break;
+    case 'makeHash': { const v = $('#hashIn').value; if (!v) return toast('Type a password first.', 'error'); $('#hashOut').textContent = "TEACHER_PASSWORD_HASH: '" + hashPw(v) + "',"; break; }
+    case 'start': {
+      const name = ($('#name').value || '').trim().replace(/\s+/g, ' ');
+      if (name.length < 2) { toast('Please enter your name.', 'error'); $('#name').focus(); return; }
+      startAttempt(name); break;
+    }
+    case 'resume': {
+      const saved = LS.get('rca.attempt', null);
+      if (!saved || !quiz || saved.sig !== quizSig()) { LS.del('rca.attempt'); view = 'studentStart'; render(); return; }
+      attempt = saved; leaveStart = null; resumeAttempt(); view = 'quiz'; render(); break;
+    }
+    case 'exitQuiz':
+      if (!confirm('Leave the quiz? The timer keeps running, and leaving is reported to your teacher.')) return;
+      ev('exited to menu', ''); saveAttempt(); attempt.lastSeen = Date.now(); saveAttempt(); attempt = null; view = 'home'; render(); break;
+    case 'submit': submitQuiz(false); break;
+    case 'template': downloadTemplate(); break;
+    case 'exportResults': exportResults(); break;
+    case 'clearQuiz': if (confirm('Remove the current quiz?')) { quiz = null; lastWarnings = []; LS.del('rca.quiz'); render(); } break;
+    case 'clearDeadline': settings.deadline = ''; saveSettings(); render(); break;
+    case 'clearResults': if (confirm('Clear all results stored on this device? Scores already in your Google Sheet are not affected.')) { results = []; pending = []; LS.set('rca.results', results); LS.set('rca.pending', pending); render(); } break;
+    case 'copyLink': copyLink(); break;
+    case 'copyScript': toast((await copyText(APPS_SCRIPT)) ? 'Script copied' : 'Could not copy', ''); break;
+    case 'retryNow': {
+      b.disabled = true; await retryPending();
+      if (view === 'result' && lastReview) setStatus(lastReview.rec.sent ? 'sent' : 'failed');
+      else toast(pending.length ? 'Still could not send. Check the webhook URL and connection.' : 'All scores sent.', pending.length ? 'error' : '');
+      break;
+    }
+    case 'testHook': {
+      if (!settings.webhook) return toast('Paste the webhook URL first.', 'error');
+      const rec = { id: uid(), timestamp: new Date().toISOString(), name: "Test (Rob's Class App)", quiz: quiz ? quiz.title : 'Test', score: 1, total: 1, percent: 100, correct: 1, questions: 1, seconds: 0, late: false, integrity: { flagged: false, summary: 'No issues detected' }, log: [{ t: 0, type: 'test', detail: 'webhook test' }], answers: [{ n: 1, q: 'Test question', chosen: 'A', correctAnswer: 'A', ok: true, points: 1, earned: 1 }] };
+      const r = await sendResult(rec);
+      toast(r === 'sent' ? 'Test sent. Check your Google Sheet for a new row.' : 'Could not reach the webhook.', r === 'sent' ? '' : 'error');
+      break;
+    }
+    case 'openSettings': openSettings(); break;
+    case 'closeSettings': closeSettings(); break;
+    case 'setMode': saveTheme({ ...getTheme(), mode: b.dataset.v }); renderSettings(); break;
+    case 'setAccent': saveTheme({ ...getTheme(), accent: b.dataset.v }); renderSettings(); break;
+    case 'install': if (deferredInstall) { deferredInstall.prompt(); deferredInstall = null; } break;
+  }
+});
+document.addEventListener('mousedown', e => { if (e.target.id === 'settingsOv') closeSettings(); });
+document.addEventListener('input', e => {
+  const k = e.target.dataset && e.target.dataset.set; if (!k) return;
+  if (k === 'customAccent') { saveTheme({ ...getTheme(), accent: e.target.value }); return; }
+  let v = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
+  if (k === 'title') { if (quiz) { quiz.title = v; saveQuiz(); } return; }
+  if (k === 'minutes') v = Math.max(0, Math.min(300, parseInt(v, 10) || 0));
+  if (k === 'webhook') v = v.trim();
+  if (k === 'deadline') v = v ? new Date(v).toISOString() : '';
+  settings[k] = v; saveSettings();
+});
+document.addEventListener('change', e => {
+  if (e.target.dataset && e.target.dataset.set === 'customAccent') renderSettings();
+  if (e.target.id === 'file') { handleFile(e.target.files[0]); e.target.value = ''; return; }
+  const t = e.target;
+  if (t.matches && t.matches('input[type=radio][data-q]') && attempt) {
+    attempt.answers[+t.dataset.q] = +t.value; saveAttempt(); updateProgress();
+  }
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeSettings();
+  if (e.key !== 'Enter') return;
+  if (e.target.id === 'name') $('[data-act="start"]').click();
+  if (e.target.id === 'pwIn') $('[data-act="unlock"]').click();
+});
+['dragover', 'dragenter'].forEach(ev => document.addEventListener(ev, e => { if (e.target.closest && e.target.closest('#drop')) { e.preventDefault(); $('#drop').classList.add('border-accent'); } }));
+['dragleave', 'drop'].forEach(ev => document.addEventListener(ev, e => { const d = e.target.closest && e.target.closest('#drop'); if (d) { e.preventDefault(); d.classList.remove('border-accent'); if (ev === 'drop') handleFile(e.dataTransfer.files[0]); } }));
+window.addEventListener('online', retryPending);
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; });
+
+/* ---------- boot ---------- */
+(async function init() {
+  installGuards();
+  if (location.hash === '#hash') view = 'hashtool';
+  await loadFromHash();
+  const saved = LS.get('rca.attempt', null);
+  if (saved && (saved.done || !quiz || saved.sig !== quizSig() || Date.now() - saved.startedAt > 12 * 3600 * 1000)) LS.del('rca.attempt');
+  render();
+  retryPending();
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
+})();
+</script>
+</body>
+</html>
