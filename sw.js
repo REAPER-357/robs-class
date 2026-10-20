@@ -1,4 +1,4 @@
-const CACHE = 'robs-class-app-v2';
+const CACHE = 'robs-class-app-v3';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon.png', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'logo.png'];
 const CDN = [
   'https://cdn.tailwindcss.com',

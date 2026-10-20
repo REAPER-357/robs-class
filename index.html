@@ -22,12 +22,14 @@ const CONFIG = {
   // Teacher password, stored as a hash (not readable). To change it:
   //   1. Open this app with  #hash  on the end of the address, e.g.  https://yoursite/#hash
   //   2. Type your new password, copy the hash it shows, paste it below.
+  //   3. The Google script holds the password too: log in, then use the Copy button in the Teacher panel to get an updated script.
   TEACHER_PASSWORD_HASH: 'dec0bd5639a5d26b2e7919543caf5cad17791abc42cb31775071b191b7108fd7',
   HASH_SALT: 'robs-class-app',   // if you change these two, regenerate the hash
   HASH_ROUNDS: 20000,
 
-  // Optional: your Google Apps Script web app URL, so students never need it in the link.
-  WEBHOOK_URL: '',
+  // Your Google web app URL (the one ending in /exec). Students' phones need it, so it must be in this file.
+  // Easy way: Teacher panel > paste the URL > press "Copy line for index.html" > paste the line over this one.
+  WEBHOOK_URL: 'https://script.google.com/macros/s/AKfycby2mMO2VOPV8ysWN25zF98cgQZ1imcb8-IfR717bckieqmE9R3FobKwZJzIqeDnB_sa_A/exec',
 
   // Big picture on the main page. Use 'icon.png' or 'logo.png' (or any file in the same folder).
   HERO_IMAGE: 'logo.png',
@@ -112,6 +114,7 @@ applyTheme(getTheme());
   .optbox { display: flex; align-items: center; gap: .75rem; border-radius: .75rem; border: 1px solid rgb(var(--line)); background: rgb(var(--sunk)); padding: .75rem 1rem; transition: border-color .15s; }
   .optbox:hover { border-color: rgb(var(--faint)); }
   .noselect { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  .noselect input { -webkit-user-select: text; user-select: text; }
   details > summary { list-style: none; } details > summary::-webkit-details-marker { display: none; }
   .swatch { width: 2.25rem; height: 2.25rem; border-radius: 999px; border: 2px solid transparent; cursor: pointer; }
   .swatch.on { outline: 2px solid rgb(var(--ink)); outline-offset: 2px; }
@@ -195,49 +198,125 @@ function hashPw(pw) {
 }
 
 /* ---------- state ---------- */
-let quiz = LS.get('rca.quiz', null);   // {title, questions:[{q, options[], answer, points}]}
-let settings = Object.assign({ webhook: '', shuffleQ: false, shuffleO: false, showReview: false, minutes: 0, deadline: '', allowLate: true, blockCopy: true }, LS.get('rca.settings', {}));
+let settings = Object.assign({ webhook: '' }, LS.get('rca.settings', {}));
 if (!settings.webhook) settings.webhook = CONFIG.WEBHOOK_URL || '';
 let results = LS.get('rca.results', []);
 let pending = LS.get('rca.pending', []);
-let view = 'home';
-let attempt = null;
+let view = 'home', lastView = '';
+let attempt = null;       // the student's quiz in progress (includes a copy of the questions)
 let lastReview = null;
-let lastWarnings = [];
-let unlocked = false;
-let timerId = null, beatId = null;
+let unlocked = false, teacherPw = '';
+let timerId = null, beatId = null, typeTimer = 0;
 let deferredInstall = null;
 let leaveStart = null;
 
-const saveSettings = () => LS.set('rca.settings', settings);
-const saveQuiz = () => LS.set('rca.quiz', quiz);
-const saveAttempt = () => { if (attempt) LS.set('rca.attempt', attempt); };
-const quizSig = () => quiz ? quiz.title + '|' + quiz.questions.length : '';
-const dlTime = () => settings.deadline ? new Date(settings.deadline).getTime() : 0;
-const isPast = () => dlTime() && Date.now() > dlTime();
-const isClosed = () => isPast() && !settings.allowLate;
+// student screen
+let classesData = LS.get('rca.classes', null), classesErr = '', classesLoading = false;
+let stuName = LS.get('rca.stuName', ''), stuClass = LS.get('rca.stuClass', ''), starting = '';
+// teacher screens
+let adminData = null, adminErr = '', adminLoading = false;
+let newClassName = '', classViewName = '', connMsg = '', draft = null, classRes = {};
 
-/* ---------- Excel parsing ---------- */
-function resolveAnswer(raw, list) {
-  if (!raw) return { k: -1 };
-  const lower = raw.toLowerCase();
-  const byText = list.findIndex(o => o.text.toLowerCase() === lower);
-  let byPos = -1;
-  const m = raw.match(/^(?:option|choice|opt)?[\s_.\-]*([a-h]|[1-8])[.)]?$/i);
-  if (m) {
-    const ch = m[1].toLowerCase();
-    const pos = /\d/.test(ch) ? parseInt(ch, 10) - 1 : ch.charCodeAt(0) - 97;
-    byPos = list.findIndex(o => o.pos === pos);
-  }
-  // the option's own text wins (so Answer "4" matches an option reading "4"); otherwise treat it as a letter/number
-  if (byText >= 0) return { k: byText, amb: byPos >= 0 && byPos !== byText };
-  return { k: byPos };
+const API = () => (settings.webhook || '').trim();
+const saveSettings = () => LS.set('rca.settings', settings);
+const saveAttempt = () => { if (attempt) LS.set('rca.attempt', attempt); };
+const dlTime = hw => hw && hw.deadline ? new Date(hw.deadline).getTime() : 0;
+const isPast = hw => !!(dlTime(hw) && Date.now() > dlTime(hw));
+const isClosed = hw => isPast(hw) && !hw.allowLate;
+
+/* ---------- talking to the Google script ---------- */
+function friendlyErr(e) {
+  const m = String((e && e.message) || e);
+  if (m === 'not-connected') return 'The app is not connected to a Google Sheet yet.';
+  if (e instanceof TypeError || /JSON|Unexpected token|Unexpected end|Failed to fetch|NetworkError|Load failed/i.test(m))
+    return 'Could not get a proper reply from Google. Check your connection, the web app URL, that access is set to "Anyone", and that you pasted the newest script and deployed it as a new version.';
+  return m;
 }
-function parseWorkbook(buf) {
-  const wb = XLSX.read(buf, { type: 'array' });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-  if (rows.length < 2) throw new Error('The sheet needs a header row plus at least one question.');
+async function apiGet(params) {
+  const base = API(); if (!base) throw new Error('not-connected');
+  const r = await fetch(base + (base.includes('?') ? '&' : '?') + new URLSearchParams(params).toString());
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || 'Request failed');
+  return j;
+}
+async function apiPost(body) {
+  const base = API(); if (!base) throw new Error('not-connected');
+  const r = await fetch(base, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || 'Request failed');
+  return j;
+}
+const admin = (action, data) => apiPost(Object.assign({ action, pw: teacherPw }, data || {}));
+
+/* ---------- Excel / sheet parsing ---------- */
+// Answers are MATCHED, not just lettered. The Answer cell can hold:
+//   - the text of the correct option (a word, a number, True / False / Not Given), or a letter A-H
+//   - for a row with no options: True / False / Not Given (or Yes / No / Not Given), or a typed answer
+//     (a number or word). Several accepted typed answers are separated with |
+const SHORT_FORMS = { t: 'true', f: 'false', ng: 'not given', 'n/g': 'not given', y: 'yes', n: 'no' };
+const NOT_GIVEN = ['not given', 'notgiven', 'ng', 'n/g'];
+
+// lower case, tidy spaces / quotes / dashes, drop punctuation at the edges
+function normAns(s) {
+  return String(s === null || s === undefined ? '' : s).normalize('NFKC').toLowerCase()
+    .replace(/[‘’‛]/g, "'").replace(/[“”]/g, '"').replace(/[‐-―]/g, '-')
+    .replace(/\s+/g, ' ').trim()
+    .replace(/^[\s"'(\[{]+|[\s"'.,;:!?)\]}]+$/g, '');
+}
+// "1,000" and "4.0" count as numbers; anything else is NaN
+function numOf(s) {
+  const t = String(s).replace(/\s/g, '');
+  if (/^[-+]?\d{1,3}(,\d{3})+(\.\d+)?$/.test(t) || /^[-+]?\d+(\.\d+)?$/.test(t)) return parseFloat(t.replace(/,/g, ''));
+  return NaN;
+}
+function sameAnswer(a, b) {
+  const x = normAns(a), y = normAns(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  const nx = numOf(x), ny = numOf(y);
+  return Number.isFinite(nx) && Number.isFinite(ny) && nx === ny;
+}
+const isNotGiven = s => NOT_GIVEN.includes(normAns(s));
+// what kind of "no options" answer is this? 'tf' (True/False), 'yn' (Yes/No), 'ng' (Not Given) or '' (typed answer)
+function implicitKind(raw) {
+  const n = normAns(raw);
+  if (['true', 'false', 't', 'f'].includes(n)) return 'tf';
+  if (['yes', 'no', 'y', 'n'].includes(n)) return 'yn';
+  if (NOT_GIVEN.includes(n)) return 'ng';
+  return '';
+}
+// position written as a letter (A-H, "Option B") or a number (1-8, "Option 2"); -1 if it isn't one
+function posOf(raw) {
+  const m = String(raw).trim().match(/^(?:option|choice|opt)?[\s_.\-]*([a-h]|[1-8])[.)]?$/i);
+  if (!m) return -1;
+  const ch = m[1].toLowerCase();
+  return /\d/.test(ch) ? parseInt(ch, 10) - 1 : ch.charCodeAt(0) - 97;
+}
+// Finds which option an Answer cell means. Order: the option's own text (words, numbers), then
+// True/False/Yes/No/Not Given short forms, then a letter position (A-H), or a number position when the sheet answers with letters.
+function resolveAnswer(raw, list, letterMode) {
+  if (!raw) return { k: -1 };
+  // a letter (B, "Option C") always counts as a position; a number (2, "Option 2") only in a sheet that answers with letters
+  const byPosIndex = () => {
+    const p = posOf(raw);
+    if (p < 0 || (/\d/.test(raw) && !letterMode)) return -1;
+    return list.findIndex(o => o.pos === p);
+  };
+  const byText = list.findIndex(o => sameAnswer(o.text, raw));
+  if (byText >= 0) {
+    const kp = byPosIndex();
+    return { k: byText, amb: kp >= 0 && kp !== byText };
+  }
+  const full = SHORT_FORMS[normAns(raw)];
+  if (full) {
+    const k = list.findIndex(o => normAns(o.text) === full || (full === 'not given' && isNotGiven(o.text)));
+    if (k >= 0) return { k };
+  }
+  return { k: byPosIndex() };
+}
+
+function parseRows(rows) {
+  if (!rows || rows.length < 2) throw new Error('The sheet needs a header row plus at least one question.');
   const head = rows[0].map(h => String(h).trim().toLowerCase());
   const qCol = head.findIndex(h => /^q(uestion)?s?\b/.test(h));
   const aCol = head.findIndex(h => /^(correct|answer|key|ans)\b/.test(h));
@@ -246,112 +325,99 @@ function parseWorkbook(buf) {
   head.forEach((h, i) => { if (i !== qCol && i !== aCol && i !== pCol && /^(?:option|choice|opt)?[\s_.\-]*([a-h]|[1-8])$/.test(h)) optCols.push(i); });
   if (qCol < 0) throw new Error('Could not find a "Question" column in row 1.');
   if (aCol < 0) throw new Error('Could not find an "Answer" column in row 1.');
-  if (optCols.length < 2) throw new Error('Need at least two option columns (e.g. "Option A", "Option B").');
-  const questions = [], warnings = [];
+
+  const data = [];
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     const text = String(r[qCol] ?? '').trim();
     if (!text) continue;
     const list = [];
     optCols.forEach((c, pos) => { const t = String(r[c] ?? '').trim(); if (t) list.push({ text: t, pos }); });
-    if (list.length < 2) { warnings.push(`Row ${i + 1}: needs at least 2 options, skipped.`); continue; }
-    const raw = String(r[aCol] ?? '').trim();
-    const { k, amb } = resolveAnswer(raw, list);
-    if (k < 0) { warnings.push(`Row ${i + 1}: answer "${raw}" doesn't match any option, skipped.`); continue; }
-    if (amb) warnings.push(`Row ${i + 1}: answer "${raw}" matches an option's text and also an option position. Used the option text "${list[k].text}". Use a letter (A, B, C…) if you meant the position.`);
     let pts = pCol >= 0 ? parseFloat(r[pCol]) : 1;
     if (!(pts > 0)) pts = 1;
-    questions.push({ q: text, options: list.map(o => o.text), answer: k, points: pts });
+    data.push({ n: i + 1, text, list, raw: String(r[aCol] ?? '').trim(), pts });
   }
-  return { questions, warnings };
+
+  // facts about the whole sheet
+  const answered = data.filter(d => d.raw);
+  const letterMode = answered.length > 0 && answered.filter(d => /^(?:option|choice|opt)?[\s_.\-]*[a-h][.)]?$/i.test(d.raw)).length / answered.length >= 0.5;
+  const bare = data.filter(d => d.list.length === 0 && d.raw);        // rows with no options
+  const hasNG = bare.some(d => implicitKind(d.raw) === 'ng');
+  const hasYN = bare.some(d => implicitKind(d.raw) === 'yn');
+  const hasTF = bare.some(d => implicitKind(d.raw) === 'tf');
+  const family = hasYN && !hasTF ? ['Yes', 'No'] : ['True', 'False'];
+  const choiceWords = family.concat(hasNG ? ['Not Given'] : []);
+  const mcRows = data.filter(d => d.list.length >= 2).length;
+
+  const questions = [], warnings = [], typedRows = [];
+  let nMc = 0, nAuto = 0, nText = 0;
+  data.forEach(d => {
+    if (!d.raw) { warnings.push(`Row ${d.n}: no answer, skipped.`); return; }
+    if (d.list.length >= 2) {
+      const { k, amb } = resolveAnswer(d.raw, d.list, letterMode);
+      if (k < 0) { warnings.push(`Row ${d.n}: answer "${d.raw}" doesn't match any option, skipped. Spell it exactly like one of the options, or use a letter (A, B, C…).`); return; }
+      if (amb) warnings.push(`Row ${d.n}: answer "${d.raw}" matches an option's text and also an option position. Used the option text "${d.list[k].text}". Use a letter (A, B, C…) if you meant the position.`);
+      questions.push({ type: 'mc', q: d.text, options: d.list.map(o => o.text), answer: k, points: d.pts }); nMc++;
+    } else if (d.list.length === 1) {
+      warnings.push(`Row ${d.n}: only one option, skipped. Give at least two, or leave them all blank.`);
+    } else if (implicitKind(d.raw)) {
+      const opts = choiceWords.map((t, pos) => ({ text: t, pos }));
+      const { k } = resolveAnswer(d.raw, opts, false);
+      if (k < 0) { warnings.push(`Row ${d.n}: answer "${d.raw}" isn't one of ${choiceWords.join(' / ')}, skipped.`); return; }
+      questions.push({ type: 'mc', q: d.text, options: choiceWords.slice(), answer: k, points: d.pts }); nAuto++;
+    } else {
+      const answers = d.raw.split(/\s*[|;\n]\s*/).map(s => s.trim()).filter(s => normAns(s));
+      if (!answers.length) { warnings.push(`Row ${d.n}: answer "${d.raw}" isn't usable, skipped.`); return; }
+      questions.push({ type: 'text', q: d.text, options: [], answers, points: d.pts }); nText++; typedRows.push(d.n);
+    }
+  });
+  // a typed-answer row in a sheet that is otherwise multiple choice is probably a forgotten set of options
+  if (mcRows > 0 && typedRows.length) {
+    warnings.push(`Row${typedRows.length > 1 ? 's' : ''} ${typedRows.slice(0, 12).join(', ')}${typedRows.length > 12 ? '…' : ''}: no options, so students will TYPE the answer. If you meant multiple choice, fill in the options.`);
+  }
+  const parts = [];
+  if (nMc) parts.push(`${nMc} multiple choice`);
+  if (nAuto) parts.push(`${nAuto} ${choiceWords.join(' / ')} (options added for you)`);
+  if (nText) parts.push(`${nText} typed answer${nText > 1 ? 's' : ''}`);
+  return { questions, warnings, summary: parts.join(' · ') };
 }
-async function handleFile(f) {
-  if (!f) return;
-  try {
-    const { questions, warnings } = parseWorkbook(await f.arrayBuffer());
-    if (!questions.length) throw new Error('No valid questions found. ' + (warnings[0] || ''));
-    quiz = { title: f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim() || 'Quiz', questions };
-    saveQuiz(); lastWarnings = warnings;
-    toast(`Loaded ${questions.length} question${questions.length > 1 ? 's' : ''}` + (warnings.length ? ` (${warnings.length} note${warnings.length > 1 ? 's' : ''}, see below)` : ''));
-    render();
-  } catch (err) { toast(err.message || 'Could not read that file.', 'error'); }
+
+// is the student's answer g right for question q? (g is an option number for multiple choice, typed text otherwise)
+const isRight = (q, g) => g !== undefined && (q.type === 'text' ? q.answers.some(a => sameAnswer(g, a)) : g === q.answer);
+
+function parseWorkbook(buf) {
+  const wb = XLSX.read(buf, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return parseRows(XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }));
 }
 function downloadTemplate() {
   const aoa = [
     ['Question', 'Option A', 'Option B', 'Option C', 'Option D', 'Answer', 'Points'],
-    ['What is the capital of France?', 'Berlin', 'Paris', 'Madrid', 'Rome', 'B', 1],
-    ['2 + 2 = ?', '3', '4', '5', '22', 'B', 1],
-    ['The Earth orbits the Sun.', 'True', 'False', '', '', 'A', 1]
+    ['What is the capital of France?', 'Berlin', 'Paris', 'Madrid', 'Rome', 'Paris', 1],
+    ['2 + 2 = ?', '3', '4', '5', '22', '4', 1],
+    ['The Earth orbits the Sun.', 'True', 'False', 'Not Given', '', 'True', 1],
+    ['The writer says cats are friendly.', '', '', '', '', 'Not Given', 1]
   ];
   const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws['!cols'] = [{ wch: 44 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 9 }, { wch: 8 }];
+  ws['!cols'] = [{ wch: 44 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 14 }, { wch: 8 }];
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Quiz');
   XLSX.writeFile(wb, 'quiz-template.xlsx');
 }
-function exportResults() {
-  const a1 = [['Timestamp', 'Name', 'Quiz', 'Score', 'Total', 'Percent', 'Late', 'Flags', 'Seconds', 'Sent to sheet']];
-  const a2 = [['Name', 'Quiz', '#', 'Question', 'Student answer', 'Correct answer', 'Correct?', 'Points']];
-  results.slice().reverse().forEach(r => {
-    a1.push([new Date(r.timestamp).toLocaleString(), r.name, r.quiz, r.score, r.total, r.percent, r.late ? 'LATE' : '', r.integrity && r.integrity.flagged ? r.integrity.summary : '', r.seconds, r.sent ? 'yes' : 'no']);
-    (r.answers || []).forEach(a => a2.push([r.name, r.quiz, a.n, a.q, a.chosen, a.correctAnswer, a.ok ? 'YES' : 'NO', a.earned]));
-  });
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(a1), 'Results');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(a2), 'Answers');
-  XLSX.writeFile(wb, 'class-results.xlsx');
-}
 
-/* ---------- share link (quiz encoded in URL hash) ---------- */
-const b64url = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
-const unb64url = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const b = atob(s); const u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
-async function encodePayload(obj) {
-  const bytes = new TextEncoder().encode(JSON.stringify(obj));
-  if ('CompressionStream' in window) {
-    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
-    return 'z' + b64url(new Uint8Array(await new Response(stream).arrayBuffer()));
-  }
-  return 'p' + b64url(bytes);
-}
-async function decodePayload(s) {
-  const bytes = unb64url(s.slice(1));
-  if (s[0] === 'z') {
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-    return JSON.parse(new TextDecoder().decode(await new Response(stream).arrayBuffer()));
-  }
-  return JSON.parse(new TextDecoder().decode(bytes));
-}
-async function copyLink() {
-  if (!quiz) return toast('Upload a quiz first.', 'error');
-  const payload = { v: 2, t: quiz.title, w: settings.webhook, o: { sq: settings.shuffleQ, so: settings.shuffleO, rv: settings.showReview, m: settings.minutes, dl: settings.deadline, late: settings.allowLate, bc: settings.blockCopy }, q: quiz.questions.map(q => [q.q, q.options, q.answer, q.points]) };
-  const url = location.href.split('#')[0] + '#q=' + await encodePayload(payload);
-  const ok = await copyText(url);
-  toast(ok ? `Student link copied (${url.length.toLocaleString()} characters)` : 'Could not copy the link.', ok ? '' : 'error');
-  if (ok && url.length > 7000) setTimeout(() => toast('Long link: some chat apps may cut it off. Test it before sharing.'), 4300);
-}
-async function loadFromHash() {
-  const m = location.hash.match(/^#q=(.+)$/);
-  if (!m) return;
-  try {
-    const p = await decodePayload(m[1]);
-    const qs = p.q.map(([q, options, answer, points]) => ({ q: String(q), options: options.map(String), answer: +answer, points: +points > 0 ? +points : 1 }));
-    if (!qs.length || qs.some(q => q.options.length < 2 || !(q.answer >= 0 && q.answer < q.options.length))) throw new Error('bad');
-    quiz = { title: String(p.t || 'Quiz'), questions: qs };
-    if (p.w) settings.webhook = String(p.w);
-    if (p.o) Object.assign(settings, { shuffleQ: !!p.o.sq, shuffleO: !!p.o.so, showReview: !!p.o.rv, minutes: +p.o.m || 0, deadline: p.o.dl ? String(p.o.dl) : '', allowLate: p.o.late !== false, blockCopy: p.o.bc !== false });
-    saveQuiz(); saveSettings();
-    history.replaceState(null, '', location.pathname + location.search);
-    toast('Quiz loaded: ' + quiz.title);
-  } catch { toast('That quiz link looks damaged.', 'error'); }
-}
-
-/* ---------- webhook ---------- */
-const payloadOf = r => ({ id: r.id, timestamp: r.timestamp, name: r.name, quiz: r.quiz, score: r.score, total: r.total, percent: r.percent, correct: r.correct, questions: r.questions, seconds: r.seconds, late: !!r.late, deadline: r.deadline || '', integrity: r.integrity || null, log: r.log || [], answers: r.answers || [] });
+/* ---------- sending a student's result ---------- */
+const payloadOf = r => ({ id: r.id, timestamp: r.timestamp, name: r.name, 'class': r.cls || '', hwId: r.hwId || '', quiz: r.quiz, score: r.score, total: r.total, percent: r.percent, correct: r.correct, questions: r.questions, seconds: r.seconds, late: !!r.late, deadline: r.deadline || '', integrity: r.integrity || null, log: r.log || [], answers: r.answers || [] });
 async function sendResult(rec) {
-  if (!settings.webhook) return 'nohook';
-  try {
-    await fetch(settings.webhook, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payloadOf(rec)) });
-    return 'sent';
-  } catch { return 'failed'; }
+  if (!API()) return 'nohook';
+  const opts = { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(payloadOf(rec)) };
+  let resp = null;
+  try { resp = await fetch(API(), opts); } catch { resp = null; }
+  if (resp) {
+    // Google answered: only call it sent if the script says it saved the result
+    try { const j = await resp.json(); return j.ok ? 'sent' : 'failed'; } catch { return 'failed'; }
+  }
+  // No readable reply (offline, or the browser hid it). Try once without needing a reply:
+  // if that gets out it counts as sent, and the script ignores a repeat of the same result.
+  try { await fetch(API(), Object.assign({}, opts, { mode: 'no-cors' })); return 'sent'; } catch { return 'failed'; }
 }
 async function deliver(rec) {
   setStatus('sending');
@@ -362,20 +428,20 @@ async function deliver(rec) {
   setStatus(r);
 }
 async function retryPending() {
-  if (!settings.webhook || !pending.length) return;
+  if (!API() || !pending.length) return;
   for (const rec of pending.slice()) {
     const r = await sendResult(rec);
     if (r === 'sent') { pending = pending.filter(p => p.id !== rec.id); const row = results.find(x => x.id === rec.id); if (row) row.sent = true; }
   }
   LS.set('rca.results', results); LS.set('rca.pending', pending);
-  if (['home', 'teacher', 'studentStart'].includes(view)) render();
+  if (view === 'home') render();
 }
 function setStatus(state) {
   const el = $('#sendStatus'); if (!el) return;
   const map = {
     sending: ['text-mute', 'Sending your score…'],
     sent: ['text-good', '✓ Your score and answers were sent to your teacher.'],
-    nohook: ['text-warn', 'Your score is saved on this device. No Google Sheet is connected yet.'],
+    nohook: ['text-warn', 'Your score is saved on this device. The app is not connected to a Google Sheet yet.'],
     failed: ['text-warn', "Couldn't send right now. Your score is saved and will retry automatically."]
   };
   const [cls, txt] = map[state];
@@ -384,46 +450,124 @@ function setStatus(state) {
 }
 
 /* ---------- Google Apps Script (paste into the Sheet) ---------- */
-const APPS_SCRIPT = `function doPost(e) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(20000);
+const APPS_SCRIPT = String.raw`// Rob's Class App: Google Sheets backend (version 3)
+// Paste this whole script into Extensions > Apps Script (from inside the Google Sheet you want to use).
+
+// Same password you use for the Teacher button. The app's "Copy" button fills this in for you.
+var TEACHER_PASSWORD = 'YOUR_PASSWORD_HERE';
+var VERSION = 3;
+
+var H_RESULTS = ['Timestamp', 'Name', 'Class', 'Homework', 'Score', 'Total', 'Percent', 'Late', 'Flags', 'Seconds', 'HW ID', 'ID'];
+var H_ANSWERS = ['ID', 'Name', 'Quiz', '#', 'Question', 'Student answer', 'Correct answer', 'Correct?', 'Points'];
+var H_LOG = ['ID', 'Name', 'Quiz', 'Seconds into quiz', 'Event', 'Detail'];
+var H_CLASSES = ['Class', 'Created'];
+var H_HW = ['ID', 'Title', 'Classes', 'Deadline', 'Allow late', 'Minutes', 'Shuffle questions', 'Shuffle options', 'Show answers', 'Block copy', 'Status', 'Issued', 'Source', 'Questions'];
+var H_Q = ['HW ID', '#', 'Question', 'Options', 'Answer', 'Points'];
+
+// Actions that change the Sheet. They run one at a time so two students submitting together can't collide.
+var WRITE_ACTIONS = { submit: 1, addClass: 1, deleteClass: 1, issue: 1, updateHw: 1, deleteHw: 1 };
+
+// ---------- entry points ----------
+function doGet(e) {
+  var p = (e && e.parameter) || {};
+  if (!p.action) return ContentService.createTextOutput("Rob's Class App webhook is live (v" + VERSION + ")");
   try {
-    var d = JSON.parse(e.postData.contents);
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var res = sheet_(ss, 'Results', ['Timestamp','Name','Quiz','Score','Total','Percent','Late','Flags','Seconds','ID']);
-    var n = res.getLastRow();
-    var ids = n > 1 ? res.getRange(2, 10, n - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
-    if (ids.indexOf(d.id) !== -1) return ContentService.createTextOutput('duplicate');
-
-    var flags = (d.integrity && d.integrity.flagged) ? d.integrity.summary : '';
-    res.appendRow([new Date(d.timestamp), safe_(d.name), safe_(d.quiz), d.score, d.total, d.percent, d.late ? 'LATE' : '', safe_(flags), d.seconds, d.id]);
-    var r = res.getLastRow();
-    if (flags) res.getRange(r, 1, 1, 10).setBackground('#fde2e2');
-    else if (d.late) res.getRange(r, 1, 1, 10).setBackground('#fff4cc');
-
-    var rows = (d.answers || []).map(function (a) {
-      return [d.id, safe_(d.name), safe_(d.quiz), a.n, safe_(a.q), safe_(a.chosen), safe_(a.correctAnswer), a.ok ? 'YES' : 'NO', a.earned];
-    });
-    append_(sheet_(ss, 'Answers', ['ID','Name','Quiz','#','Question','Student answer','Correct answer','Correct?','Points']), rows);
-
-    var log = (d.log || []).map(function (l) {
-      return [d.id, safe_(d.name), safe_(d.quiz), l.t, safe_(l.type), safe_(l.detail)];
-    });
-    append_(sheet_(ss, 'Activity log', ['ID','Name','Quiz','Seconds into quiz','Event','Detail']), log);
-    return ContentService.createTextOutput('ok');
-  } finally {
-    lock.releaseLock();
+    if (p.action === 'ping') return json_({ ok: true, version: VERSION });
+    if (p.action === 'classes') return json_({ ok: true, classes: publicClasses_() });
+    if (p.action === 'quiz') return json_(getQuiz_(p.id));
+    return json_({ ok: false, error: 'Unknown action' });
+  } catch (err) {
+    return json_({ ok: false, error: msg_(err) });
   }
 }
 
-function doGet() {
-  return ContentService.createTextOutput("Rob's Class App webhook is live");
+function doPost(e) {
+  var d;
+  try {
+    d = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return json_({ ok: false, error: 'Bad request' });
+  }
+  var a = (d && d.action) || 'submit';
+  try {
+    // Students need no password. Everything else does. Checked before taking the lock, so wrong guesses can't hold up students.
+    if (a !== 'submit') checkPassword_(d.pw);
+
+    if (!WRITE_ACTIONS[a]) {
+      switch (a) {
+        case 'adminPing': return json_({ ok: true, version: VERSION });
+        case 'adminList': return json_(adminList_());
+        case 'readSheet': return json_(readSheet_(d.url));
+        case 'classResults': return json_(classResults_(d.name));
+      }
+      return json_({ ok: false, error: 'Unknown action' });
+    }
+
+    var lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(30000);
+    } catch (err) {
+      return json_({ ok: false, error: 'The Google script is busy. Try again in a moment.' });
+    }
+    try {
+      switch (a) {
+        case 'submit': return json_(saveResult_(d));
+        case 'addClass': return json_(addClass_(d.name));
+        case 'deleteClass': return json_(deleteClass_(d.name));
+        case 'issue': return json_(issue_(d));
+        case 'updateHw': return json_(updateHw_(d));
+        case 'deleteHw': return json_(deleteHw_(d.id));
+      }
+    } finally {
+      lock.releaseLock();
+    }
+    return json_({ ok: false, error: 'Unknown action' });
+  } catch (err) {
+    return json_({ ok: false, error: msg_(err) });
+  }
 }
 
-function sheet_(ss, name, headers) {
+// Run this once from the editor (choose "setup" and press Run) to grant permission and create the tabs.
+function setup() {
+  sheet_('Results', H_RESULTS);
+  sheet_('Answers', H_ANSWERS);
+  sheet_('Activity log', H_LOG);
+  sheet_('Classes', H_CLASSES, true);
+  sheet_('Homework', H_HW, true);
+  sheet_('Questions', H_Q, true);
+  Logger.log('Ready. Your tabs are in: ' + ss_().getUrl());
+}
+
+// ---------- helpers ----------
+function json_(o) {
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function msg_(err) {
+  return String((err && err.message) || err);
+}
+
+function ss_() {
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+// Finds a tab (creating it with a header row if needed). If an older tab with the same name has
+// different columns, it is renamed "(old ...)" and a fresh one is made, so nothing is lost.
+function sheet_(name, headers, asText) {
+  var ss = ss_();
   var sh = ss.getSheetByName(name);
+  if (sh && sh.getLastRow() > 0) {
+    var cur = sh.getRange(1, 1, 1, headers.length).getValues()[0].join('|');
+    if (cur !== headers.join('|')) {
+      sh.setName(name + ' (old ' + Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd HHmmss') + ')');
+      sh = null;
+    }
+  }
   if (!sh) {
     sh = ss.insertSheet(name);
+    if (asText) sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).setNumberFormat('@');
+  }
+  if (sh.getLastRow() === 0) {
     sh.appendRow(headers);
     sh.setFrozenRows(1);
     sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
@@ -439,7 +583,297 @@ function append_(sh, rows) {
 function safe_(v) {
   v = (v === null || v === undefined) ? '' : String(v);
   return ['=', '+', '-', '@'].indexOf(v.charAt(0)) !== -1 ? "'" + v : v;
-}`;
+}
+
+// For teacher-typed names and titles: tidy spaces and drop leading = + - @
+function clean_(s) {
+  return String(s === null || s === undefined ? '' : s).replace(/\s+/g, ' ').replace(/^[=+\-@\s]+/, '').trim();
+}
+
+function cap_(v, n) {
+  return String(v === null || v === undefined ? '' : v).slice(0, n);
+}
+
+function num_(v) {
+  v = Number(v);
+  return isFinite(v) ? v : 0;
+}
+
+// Wrong guesses are slowed down (not locked out), so a student can't lock the teacher out by guessing.
+function checkPassword_(pw) {
+  if (!TEACHER_PASSWORD || TEACHER_PASSWORD.indexOf('YOUR_PASSWORD') === 0) {
+    throw new Error('Set TEACHER_PASSWORD at the top of the Google script (use the Copy button in the app, which fills it in).');
+  }
+  if (typeof pw !== 'string' || pw !== TEACHER_PASSWORD) {
+    Utilities.sleep(2000);
+    throw new Error('The password in the Google script does not match the one you typed. Copy the script from the app again and redeploy.');
+  }
+}
+
+// ---------- results from students ----------
+function saveResult_(d) {
+  var name = safe_(cap_(d.name, 60).replace(/\s+/g, ' ').trim());
+  var id = cap_(d.id, 40);
+  if (!name || !id) throw new Error('Missing name or id.');
+
+  var res = sheet_('Results', H_RESULTS);
+  var n = res.getLastRow();
+  var ids = n > 1 ? res.getRange(2, 12, n - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
+  if (ids.indexOf(id) !== -1) return { ok: true, duplicate: true };
+
+  var ts = new Date(d.timestamp);
+  if (isNaN(ts.getTime())) ts = new Date();
+  var integ = d.integrity || {};
+  var flags = integ.flagged ? cap_(integ.summary, 500) : '';
+  var quiz = safe_(cap_(d.quiz, 100));
+  res.appendRow([ts, name, safe_(cap_(d['class'], 60)), quiz, num_(d.score), num_(d.total), num_(d.percent),
+    d.late ? 'LATE' : '', safe_(flags), num_(d.seconds), cap_(d.hwId, 40), id]);
+  var r = res.getLastRow();
+  if (flags) res.getRange(r, 1, 1, H_RESULTS.length).setBackground('#fde2e2');
+  else if (d.late) res.getRange(r, 1, 1, H_RESULTS.length).setBackground('#fff4cc');
+
+  var rows = (d.answers || []).slice(0, 300).map(function (a) {
+    return [id, name, quiz, num_(a.n), safe_(cap_(a.q, 500)), safe_(cap_(a.chosen, 300)), safe_(cap_(a.correctAnswer, 300)), a.ok ? 'YES' : 'NO', num_(a.earned)];
+  });
+  append_(sheet_('Answers', H_ANSWERS), rows);
+
+  var log = (d.log || []).slice(0, 300).map(function (l) {
+    return [id, name, quiz, num_(l.t), safe_(cap_(l.type, 60)), safe_(cap_(l.detail, 200))];
+  });
+  append_(sheet_('Activity log', H_LOG), log);
+  return { ok: true };
+}
+
+// ---------- classes ----------
+function classNames_() {
+  var sh = sheet_('Classes', H_CLASSES, true);
+  var n = sh.getLastRow();
+  if (n < 2) return [];
+  return sh.getRange(2, 1, n - 1, 1).getValues().map(function (r) { return String(r[0]); }).filter(function (s) { return s; });
+}
+
+function addClass_(name) {
+  name = clean_(name);
+  if (!name) throw new Error('Type a class name.');
+  if (name.length > 40) throw new Error('Class name is too long (40 characters max).');
+  var list = classNames_();
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].toLowerCase() === name.toLowerCase()) throw new Error('That class already exists.');
+  }
+  sheet_('Classes', H_CLASSES, true).appendRow([name, new Date().toISOString()]);
+  return { ok: true, classes: classNames_() };
+}
+
+function deleteClass_(name) {
+  var sh = sheet_('Classes', H_CLASSES, true);
+  var n = sh.getLastRow();
+  if (n > 1) {
+    var vals = sh.getRange(2, 1, n - 1, 1).getValues();
+    for (var i = vals.length - 1; i >= 0; i--) {
+      if (String(vals[i][0]) === String(name)) sh.deleteRow(i + 2);
+    }
+  }
+  return { ok: true, classes: classNames_() };
+}
+
+// ---------- homework ----------
+function rowToHw_(r) {
+  var classes = [];
+  try { classes = JSON.parse(r[2]) || []; } catch (e) { classes = []; }
+  return {
+    id: String(r[0]), title: String(r[1]), classes: classes, deadline: String(r[3] || ''),
+    allowLate: String(r[4]) !== 'no', minutes: Number(r[5]) || 0,
+    shuffleQ: String(r[6]) === 'yes', shuffleO: String(r[7]) === 'yes',
+    showReview: String(r[8]) === 'yes', blockCopy: String(r[9]) !== 'no',
+    status: String(r[10]) || 'open', issued: String(r[11] || ''), source: String(r[12] || ''), count: Number(r[13]) || 0
+  };
+}
+
+function readHw_() {
+  var sh = sheet_('Homework', H_HW, true);
+  var n = sh.getLastRow();
+  if (n < 2) return [];
+  return sh.getRange(2, 1, n - 1, H_HW.length).getValues().map(rowToHw_).filter(function (h) { return h.id; });
+}
+
+function publicHw_(h) {
+  return { id: h.id, title: h.title, classes: h.classes, deadline: h.deadline, allowLate: h.allowLate, minutes: h.minutes,
+    shuffleQ: h.shuffleQ, shuffleO: h.shuffleO, showReview: h.showReview, blockCopy: h.blockCopy, count: h.count };
+}
+
+function findRow_(sh, id) {
+  var n = sh.getLastRow();
+  if (n < 2) return 0;
+  var ids = sh.getRange(2, 1, n - 1, 1).getValues();
+  for (var i = 0; i < ids.length; i++) {
+    if (String(ids[i][0]) === String(id)) return i + 2;
+  }
+  return 0;
+}
+
+function publicClasses_() {
+  var open = readHw_().filter(function (h) { return h.status === 'open'; });
+  return classNames_().map(function (name) {
+    return {
+      name: name,
+      homework: open.filter(function (h) { return h.classes.indexOf(name) !== -1; }).map(publicHw_)
+    };
+  });
+}
+
+function getQuiz_(id) {
+  var hw = null;
+  readHw_().forEach(function (h) { if (h.id === String(id)) hw = h; });
+  if (!hw) throw new Error('That homework was not found.');
+  if (hw.status !== 'open') throw new Error('This homework has been closed by your teacher.');
+  var sh = sheet_('Questions', H_Q, true);
+  var n = sh.getLastRow();
+  var qs = [];
+  if (n > 1) {
+    sh.getRange(2, 1, n - 1, H_Q.length).getValues().forEach(function (r) {
+      if (String(r[0]) === hw.id) {
+        var raw = String(r[4]);
+        var item = { n: Number(r[1]), q: String(r[2]), options: JSON.parse(r[3]), points: Number(r[5]) || 1 };
+        if (raw.charAt(0) === '[') { item.type = 'text'; item.answers = JSON.parse(raw); }
+        else { item.type = 'mc'; item.answer = Number(raw); }
+        qs.push(item);
+      }
+    });
+  }
+  qs.sort(function (a, b) { return a.n - b.n; });
+  return { ok: true, hw: publicHw_(hw), questions: qs };
+}
+
+function adminList_() {
+  var res = sheet_('Results', H_RESULTS);
+  var n = res.getLastRow();
+  var counts = {};
+  if (n > 1) {
+    res.getRange(2, 11, n - 1, 1).getValues().forEach(function (r) {
+      var k = String(r[0]);
+      if (k) counts[k] = (counts[k] || 0) + 1;
+    });
+  }
+  var hws = readHw_().reverse().map(function (h) { h.submissions = counts[h.id] || 0; return h; });
+  return { ok: true, sheetUrl: ss_().getUrl(), classes: classNames_(), homework: hws };
+}
+
+// Latest submissions for one class (newest first), for the class page in the app.
+function classResults_(name) {
+  var res = sheet_('Results', H_RESULTS);
+  var n = res.getLastRow();
+  var out = [];
+  if (n > 1) {
+    var vals = res.getRange(2, 1, n - 1, H_RESULTS.length).getValues();
+    for (var i = vals.length - 1; i >= 0 && out.length < 300; i--) {
+      var r = vals[i];
+      if (String(r[2]) !== String(name)) continue;
+      out.push({
+        ts: r[0] instanceof Date ? r[0].toISOString() : String(r[0]), name: String(r[1]), hw: String(r[3]),
+        score: Number(r[4]), total: Number(r[5]), percent: Number(r[6]), late: String(r[7]) === 'LATE',
+        flags: String(r[8]), seconds: Number(r[9]), hwId: String(r[10])
+      });
+    }
+  }
+  return { ok: true, results: out };
+}
+
+// Reads the question rows out of a Google Sheet in your Drive. The app turns them into questions.
+function readSheet_(url) {
+  url = String(url || '').trim();
+  if (!url) throw new Error('Paste the link to your Google Sheet.');
+  var src;
+  try {
+    src = /^https?:/i.test(url) ? SpreadsheetApp.openByUrl(url) : SpreadsheetApp.openById(url);
+  } catch (err) {
+    throw new Error("Couldn't open that Google Sheet. Check the link, and that it is a real Google Sheet (an Excel file in Drive must first be opened and saved as a Google Sheet) owned by the same Google account as this script.");
+  }
+  var sheets = src.getSheets();
+  var sh = sheets[0];
+  var m = url.match(/[#&?]gid=(\d+)/);
+  if (m) {
+    sheets.forEach(function (s) { if (String(s.getSheetId()) === m[1]) sh = s; });
+  }
+  var rows = sh.getDataRange().getDisplayValues();
+  if (rows.length > 1001) rows = rows.slice(0, 1001);
+  return { ok: true, title: src.getName(), tab: sh.getName(), rows: rows };
+}
+
+function issue_(d) {
+  var title = clean_(d.title);
+  if (!title) throw new Error('Give the homework a title.');
+  var known = classNames_();
+  var classes = (d.classes || []).map(String).filter(function (c) { return known.indexOf(c) !== -1; });
+  if (!classes.length) throw new Error('Pick at least one class.');
+  var qs = d.questions || [];
+  if (!qs.length) throw new Error('There are no questions to issue.');
+  if (qs.length > 300) throw new Error('Too many questions (300 max).');
+  qs.forEach(function (q, i) {
+    var bad;
+    if (q && q.type === 'text') {
+      // typed answer: no options, one or more accepted answers
+      bad = typeof q.q !== 'string' || !q.q.trim() || q.q.length > 2000 || !(Number(q.points) > 0) ||
+        !q.answers || !q.answers.length || q.answers.length > 10 ||
+        q.answers.some(function (a) { return typeof a !== 'string' || !a.trim() || a.length > 200; });
+    } else {
+      bad = !q || typeof q.q !== 'string' || !q.q.trim() || q.q.length > 2000 ||
+        !q.options || q.options.length < 2 || q.options.length > 8 ||
+        q.options.some(function (o) { return String(o).length > 500; }) ||
+        !(q.answer >= 0 && q.answer < q.options.length) || !(Number(q.points) > 0);
+    }
+    if (bad) throw new Error('Question ' + (i + 1) + ' is not valid.');
+  });
+  var id = 'hw-' + Utilities.getUuid().slice(0, 8);
+  sheet_('Homework', H_HW, true).appendRow([
+    id, title, JSON.stringify(classes), String(d.deadline || ''), d.allowLate === false ? 'no' : 'yes', Number(d.minutes) || 0,
+    d.shuffleQ ? 'yes' : 'no', d.shuffleO ? 'yes' : 'no', d.showReview ? 'yes' : 'no', d.blockCopy === false ? 'no' : 'yes',
+    'open', new Date().toISOString(), clean_(d.source || ''), qs.length
+  ]);
+  var rows = qs.map(function (q, i) {
+    // A typed-answer question has no options, and its Answer cell holds the list of accepted answers as JSON.
+    if (q.type === 'text') return [id, i + 1, String(q.q), '[]', JSON.stringify(q.answers.map(String)), Number(q.points)];
+    return [id, i + 1, String(q.q), JSON.stringify(q.options.map(String)), q.answer, Number(q.points)];
+  });
+  append_(sheet_('Questions', H_Q, true), rows);
+  return { ok: true, id: id };
+}
+
+function updateHw_(d) {
+  var sh = sheet_('Homework', H_HW, true);
+  var row = findRow_(sh, d.id);
+  if (!row) throw new Error('That homework was not found.');
+  var set = function (col, v) { sh.getRange(row, col).setValue(v); };
+  if (d.title !== undefined) {
+    var t = clean_(d.title);
+    if (!t) throw new Error('Title cannot be empty.');
+    set(2, t);
+  }
+  if (d.deadline !== undefined) set(4, String(d.deadline || ''));
+  if (d.allowLate !== undefined) set(5, d.allowLate ? 'yes' : 'no');
+  if (d.minutes !== undefined) set(6, Number(d.minutes) || 0);
+  if (d.status !== undefined) set(11, d.status === 'closed' ? 'closed' : 'open');
+  return { ok: true };
+}
+
+function deleteHw_(id) {
+  var sh = sheet_('Homework', H_HW, true);
+  var row = findRow_(sh, id);
+  if (row) sh.deleteRow(row);
+  var q = sheet_('Questions', H_Q, true);
+  var n = q.getLastRow();
+  if (n > 1) {
+    var ids = q.getRange(2, 1, n - 1, 1).getValues();
+    for (var i = ids.length - 1; i >= 0; i--) {
+      if (String(ids[i][0]) === String(id)) q.deleteRow(i + 2);
+    }
+  }
+  return { ok: true };
+}
+`;
+// The Copy button fills in your teacher password so you don't have to edit the script by hand.
+function scriptWithPassword() {
+  return teacherPw ? APPS_SCRIPT.replace("'YOUR_PASSWORD_HERE'", () => JSON.stringify(teacherPw)) : APPS_SCRIPT;
+}
 
 /* ---------- integrity tracking ---------- */
 const newStats = () => ({ leaves: 0, awayMs: 0, copies: 0, pastes: 0, menus: 0, prints: 0, resumes: 0 });
@@ -483,9 +917,9 @@ function installGuards() {
   window.addEventListener('blur', () => onLeave('window lost focus'));
   window.addEventListener('focus', onReturn);
   window.addEventListener('pagehide', () => { if (tracking()) { attempt.lastSeen = Date.now(); saveAttempt(); } });
-  ['copy', 'cut'].forEach(t => document.addEventListener(t, e => { if (!tracking()) return; attempt.stats.copies++; ev(t, 'tried to ' + t + ' text'); if (settings.blockCopy) e.preventDefault(); }));
+  ['copy', 'cut'].forEach(t => document.addEventListener(t, e => { if (!tracking()) return; attempt.stats.copies++; ev(t, 'tried to ' + t + ' text'); if (attempt.hw && attempt.hw.blockCopy !== false) e.preventDefault(); }));
   document.addEventListener('paste', () => { if (!tracking()) return; attempt.stats.pastes++; ev('paste', 'pasted into the page'); });
-  document.addEventListener('contextmenu', e => { if (!tracking()) return; attempt.stats.menus++; ev('right-click', ''); if (settings.blockCopy) e.preventDefault(); });
+  document.addEventListener('contextmenu', e => { if (!tracking()) return; attempt.stats.menus++; ev('right-click', ''); if (attempt.hw && attempt.hw.blockCopy !== false) e.preventDefault(); });
   window.addEventListener('beforeprint', () => { if (!tracking()) return; attempt.stats.prints++; ev('print', 'print dialog opened'); });
   document.addEventListener('keydown', e => {
     if (!tracking()) return;
@@ -499,10 +933,23 @@ const ICON_GEAR = '<svg viewBox="0 0 24 24" class="w-[18px] h-[18px]" fill="none
 const ICON_CAP = '<svg viewBox="0 0 24 24" class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10 12 5 2 10l10 5 10-5z"/><path d="M6 12v5c3 2.5 9 2.5 12 0v-5"/></svg>';
 const ICON_LOCK = '<svg viewBox="0 0 24 24" class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
 
+
+
+const dueChip = hw => {
+  if (!hw.deadline) return '<span class="chip">No deadline</span>';
+  if (isClosed(hw)) return badge('Closed ' + fmtDate(hw.deadline), 'bad');
+  if (isPast(hw)) return badge('Past due: ' + fmtDate(hw.deadline), 'warn');
+  return `<span class="chip">Due ${esc(fmtDate(hw.deadline))}</span>`;
+};
+const msgOk = t => `<div class="text-good">✓ ${esc(t)}</div>`;
+const msgBad = t => `<div class="text-bad">✗ ${esc(t)}</div>`;
+const spinner = t => `<div class="text-sm text-mute py-3">${esc(t)}</div>`;
+const typedInput = qi => `<div class="mt-4"><label class="sr-only" for="t${qi}">Your answer</label><input id="t${qi}" data-t="${qi}" class="input" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="200" placeholder="Type your answer" value="${esc(attempt.answers[qi] === undefined ? '' : attempt.answers[qi])}"></div>`;
+
 function headerHTML() {
   if (view === 'home') return '';
   const right = view === 'quiz' ? '<button data-act="exitQuiz" class="btn btn-ghost">Exit</button>'
-    : view === 'teacher' ? '<button data-act="lock" class="btn btn-ghost">Lock &amp; exit</button>'
+    : ['teacher', 'classView', 'compose'].includes(view) ? '<button data-act="lock" class="btn btn-ghost">Lock &amp; exit</button>'
     : '<button data-act="home" class="btn btn-ghost">← Home</button>';
   return `<div class="max-w-5xl mx-auto px-4 h-14 flex items-center justify-between gap-3"><div class="font-bold tracking-tight truncate">${esc(CONFIG.APP_NAME)}</div>${right}</div>`;
 }
@@ -522,32 +969,41 @@ function homeView() {
   <button data-act="openSettings" aria-label="Settings" title="Settings" class="fixed bottom-4 right-4 z-40 w-9 h-9 rounded-full grid place-items-center border border-line bg-card text-mute hover:text-ink opacity-80 hover:opacity-100 transition" style="margin-bottom:env(safe-area-inset-bottom)">${ICON_GEAR}</button>`;
 }
 
+/* ----- student ----- */
 function studentStartView() {
   const saved = LS.get('rca.attempt', null);
-  const resume = saved && quiz && !saved.done && saved.sig === quizSig();
-  if (!quiz) return `<div class="max-w-xl mx-auto"><section class="card text-center"><h2 class="text-xl font-bold">No quiz yet</h2><p class="text-mute mt-2 text-sm">Ask your teacher for the quiz link and open it on this device.</p></section></div>`;
-  const total = quiz.questions.reduce((s, q) => s + q.points, 0);
-  const due = settings.deadline ? (isClosed() ? badge('Closed ' + fmtDate(settings.deadline), 'bad') : isPast() ? badge('Past due: will be marked LATE', 'warn') : `<span class="chip">Due ${esc(fmtDate(settings.deadline))}</span>`) : '';
+  const resume = saved && !saved.done && saved.quiz ? saved : null;
+  const list = classesData || [];
+  const cur = list.find(c => c.name === stuClass);
+  let body;
+  if (!API()) body = `<div class="rounded-xl p-3 text-sm border border-warn/40 bg-warn/10 text-warn">This app isn't connected to your teacher's Google Sheet yet. Tell your teacher.</div>`;
+  else if (!classesData && classesLoading) body = spinner('Loading your classes…');
+  else if (!classesData && classesErr) body = `<div class="rounded-xl p-3 text-sm border border-bad/40 bg-bad/10 text-bad">${esc(classesErr)} <button data-act="reloadClasses" class="underline font-semibold">Try again</button></div>`;
+  else {
+    const hwHtml = !stuClass ? '' : !cur ? `<p class="text-sm text-mute mt-4">That class no longer exists. Choose another.</p>`
+      : !cur.homework.length ? `<p class="text-sm text-mute mt-4">No homework for ${esc(cur.name)} right now.</p>`
+      : `<div class="mt-5 space-y-3">${cur.homework.map(h => `
+        <div class="rounded-xl border border-line bg-sunk p-4">
+          <div class="font-semibold">${esc(h.title)}</div>
+          <div class="flex flex-wrap gap-1.5 mt-2"><span class="chip">${h.count} questions</span>${h.minutes ? `<span class="chip">⏱ ${h.minutes} min</span>` : ''}${dueChip(h)}</div>
+          <button data-act="startHw" data-v="${esc(h.id)}" class="btn btn-primary w-full mt-3" ${isClosed(h) || starting ? 'disabled' : ''}>${starting === h.id ? 'Loading…' : isClosed(h) ? 'Closed' : 'Start'}</button>
+        </div>`).join('')}</div>`;
+    body = `<label class="label" for="stuName">Your name</label>
+      <input id="stuName" data-st="name" class="input" maxlength="60" autocomplete="name" placeholder="First and last name" value="${esc(stuName)}">
+      <label class="label mt-4" for="stuClass">Your class</label>
+      <select id="stuClass" data-st="cls" class="input"><option value="">Choose your class</option>${list.map(c => `<option value="${esc(c.name)}" ${c.name === stuClass ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>
+      ${list.length === 0 ? '<p class="text-sm text-mute mt-3">Your teacher has not added any classes yet.</p>' : ''}
+      ${hwHtml}
+      <div class="mt-4 rounded-xl p-3 text-sm border border-warn/40 bg-warn/10 text-warn"><b>Honest-work notice:</b> leaving the page, switching apps, copying text and similar activity is recorded and sent to your teacher with your answers.</div>`;
+  }
   return `<div class="max-w-xl mx-auto">
     <div class="text-center mb-6"><h1 class="text-3xl font-extrabold tracking-tight">Student</h1></div>
-    <section class="card">
-      <div class="text-xs uppercase tracking-wider text-accent-text font-semibold">Quiz</div>
-      <h2 class="text-xl font-bold mt-1">${esc(quiz.title)}</h2>
-      <div class="flex flex-wrap gap-2 mt-3">
-        <span class="chip">${quiz.questions.length} questions</span><span class="chip">${fmt(total)} points</span>
-        ${settings.minutes ? `<span class="chip">⏱ ${settings.minutes} min</span>` : ''}${due}
-      </div>
-      <div class="mt-4 rounded-xl p-3 text-sm border border-warn/40 bg-warn/10 text-warn">
-        <b>Honest-work notice:</b> leaving this page, switching apps, copying text and similar activity is recorded and sent to your teacher with your answers.
-      </div>
-      ${resume ? `<div class="mt-5"><p class="text-sm text-mute mb-2">You have a quiz in progress as <b class="text-ink">${esc(saved.name)}</b>. The timer kept running.</p>
-        <button data-act="resume" class="btn btn-primary w-full">Continue quiz</button></div>` : `
-      <div class="mt-5"><label class="label" for="name">Your name</label>
-      <input id="name" class="input" maxlength="60" autocomplete="name" placeholder="First and last name" ${isClosed() ? 'disabled' : ''}>
-      <button data-act="start" class="btn btn-primary w-full mt-4" ${isClosed() ? 'disabled' : ''}>Start quiz</button></div>`}
-    </section></div>`;
+    ${resume ? `<section class="card mb-4"><p class="text-sm text-mute">You have a quiz in progress: <b class="text-ink">${esc(resume.quiz.title)}</b> as <b class="text-ink">${esc(resume.name)}</b>. The timer kept running.</p>
+      <button data-act="resume" class="btn btn-primary w-full mt-3">Continue quiz</button></section>` : ''}
+    <section class="card">${body}</section></div>`;
 }
 
+/* ----- teacher: login ----- */
 function loginView() {
   return `<div class="max-w-sm mx-auto"><section class="card">
     <h2 class="text-lg font-bold">Teacher login</h2>
@@ -562,123 +1018,179 @@ function loginView() {
 function hashToolView() {
   return `<div class="max-w-xl mx-auto"><section class="card">
     <h2 class="text-lg font-bold">Password hash tool</h2>
-    <p class="text-sm text-mute mt-1 mb-4">Type the new teacher password. Copy the line below into <code>CONFIG</code> at the top of index.html, then upload the file to GitHub. Nothing is sent anywhere.</p>
+    <p class="text-sm text-mute mt-1 mb-4">Type the new teacher password. Copy the line below into <code>CONFIG</code> at the top of index.html, then upload the file to your website. Nothing is sent anywhere. Remember the Google script holds the password too: use the Copy button in the Teacher panel to get an updated script.</p>
     <input id="hashIn" type="text" class="input" placeholder="New password" autocomplete="off">
     <button data-act="makeHash" class="btn btn-primary w-full mt-3">Generate hash</button>
     <pre id="hashOut" class="mt-4 rounded-xl bg-sunk border border-line p-3 text-xs overflow-x-auto whitespace-pre-wrap break-all text-mute">The hash will appear here.</pre>
   </section></div>`;
 }
 
-function teacherView() {
-  const q = quiz;
-  const preview = q ? q.questions.map((x, i) => `
-    <li class="py-3 border-t border-line first:border-0">
-      <div class="font-medium text-sm"><span class="text-faint">${i + 1}.</span> ${esc(x.q)} <span class="text-xs text-faint">(${fmt(x.points)} pt)</span></div>
-      <ul class="mt-1.5 grid sm:grid-cols-2 gap-x-4 gap-y-0.5 text-sm">
-        ${x.options.map((o, j) => `<li class="${j === x.answer ? 'text-good font-semibold' : 'text-mute'}">${LETTERS[j]}. ${esc(o)}${j === x.answer ? ' ✓' : ''}</li>`).join('')}
-      </ul></li>`).join('') : '';
-  const resList = results.slice(0, 50).map(r => `
-    <details class="rounded-xl border border-line bg-sunk">
-      <summary class="cursor-pointer px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span class="font-semibold">${esc(r.name)}</span>
-        <span>${fmt(r.score)}/${fmt(r.total)} <span class="text-faint">(${r.percent}%)</span></span>
-        ${r.late ? badge('LATE', 'warn') : ''}${r.integrity && r.integrity.flagged ? badge('FLAGGED', 'bad') : ''}
-        <span class="ml-auto text-xs text-faint">${esc(new Date(r.timestamp).toLocaleString())} · ${r.sent ? '<span class="text-good">sent ✓</span>' : '<span class="text-warn">not sent</span>'}</span>
-      </summary>
-      <div class="px-4 pb-4 text-sm space-y-3">
-        <div class="text-mute"><b class="text-ink">Activity:</b> ${esc(r.integrity ? r.integrity.summary : 'n/a')} · took ${fmtDur(r.seconds || 0)}</div>
-        ${(r.answers || []).length ? `<ol class="space-y-1">${r.answers.map(a => `<li class="${a.ok ? 'text-good' : 'text-bad'}">${a.ok ? '✓' : '✗'} <span class="text-mute">${a.n}. ${esc(a.q)}</span><br><span class="pl-4">Answered: ${esc(a.chosen)}${a.ok ? '' : ' · Correct: ' + esc(a.correctAnswer)}</span></li>`).join('')}</ol>` : ''}
-        ${(r.log || []).length ? `<div><b>Event log</b><ul class="mt-1 text-xs text-mute font-mono">${r.log.map(l => `<li>${fmtDur(l.t)} · ${esc(l.type)} ${esc(l.detail)}</li>`).join('')}</ul></div>` : ''}
-      </div></details>`).join('');
-  const chk = (key, label, full) => `<label class="flex items-center gap-3 rounded-xl bg-sunk border border-line px-4 py-3 cursor-pointer ${full ? 'sm:col-span-2' : ''}"><input type="checkbox" data-set="${key}" class="w-4 h-4" style="accent-color:rgb(var(--accent))" ${settings[key] ? 'checked' : ''}> ${label}</label>`;
-  return `<div class="max-w-3xl mx-auto space-y-5">
-    <section class="card">
-      <div class="flex items-start justify-between gap-3 flex-wrap">
-        <div><h2 class="text-lg font-bold">1. Upload your quiz</h2>
-        <p class="text-sm text-mute mt-1">Excel (.xlsx, .xls) or CSV. Columns: <b class="text-ink">Question</b>, <b class="text-ink">Option A–H</b>, <b class="text-ink">Answer</b> (letter or text), optional <b class="text-ink">Points</b>.</p></div>
-        <button data-act="template" class="btn btn-ghost">Download template</button>
-      </div>
-      <label id="drop" for="file" class="mt-4 block cursor-pointer rounded-2xl border-2 border-dashed border-line hover:border-accent transition p-8 text-center">
-        <div class="font-semibold">Drop a spreadsheet here, or tap to choose</div>
-        <div class="text-xs text-faint mt-1">Only the first sheet is used.</div>
-      </label>
-      <input id="file" type="file" class="hidden" accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv">
-      ${lastWarnings.length ? `<div class="mt-4 rounded-xl border border-warn/40 bg-warn/10 p-3 text-sm text-warn"><b>${lastWarnings.length} note${lastWarnings.length > 1 ? 's' : ''} about your spreadsheet</b><ul class="list-disc ml-5 mt-1 space-y-0.5">${lastWarnings.slice(0, 8).map(w => `<li>${esc(w)}</li>`).join('')}${lastWarnings.length > 8 ? `<li>…and ${lastWarnings.length - 8} more</li>` : ''}</ul></div>` : ''}
-      ${q ? `<div class="mt-5">
-        <label class="label" for="title">Quiz title</label>
-        <input id="title" data-set="title" class="input" value="${esc(q.title)}" maxlength="80">
-        <details class="mt-4"><summary class="cursor-pointer text-sm text-accent-text font-semibold">Preview ${q.questions.length} questions</summary><ul class="mt-2">${preview}</ul></details>
-        <div class="mt-4"><button data-act="clearQuiz" class="btn btn-danger">Remove quiz</button></div>
-      </div>` : ''}
-    </section>
-
-    <section class="card">
-      <h2 class="text-lg font-bold">2. Deadline &amp; rules</h2>
-      <div class="mt-4 grid sm:grid-cols-2 gap-4">
-        <div><label class="label" for="deadline">Deadline (your local time)</label>
-          <div class="flex gap-2"><input id="deadline" data-set="deadline" type="datetime-local" class="input" value="${esc(toLocalInput(settings.deadline))}"><button data-act="clearDeadline" class="btn btn-ghost">Clear</button></div></div>
-        <div><label class="label" for="minutes">Time limit (minutes, 0 = none)</label><input id="minutes" data-set="minutes" type="number" min="0" max="300" class="input" value="${settings.minutes}"></div>
-      </div>
-      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
-        ${chk('allowLate', 'Allow late submissions (marked LATE in your sheet)')}
-        ${chk('blockCopy', 'Block copying &amp; right-click on questions')}
-        ${chk('shuffleQ', 'Shuffle question order')}
-        ${chk('shuffleO', 'Shuffle answer options')}
-        ${chk('showReview', 'Show students the correct answers after they submit', true)}
-      </div>
-      <p class="text-xs text-faint mt-3">Activity tracking is always on: leaving the page, closing and resuming, copy/paste and print keys are logged and sent with the results. If late submissions are off, the quiz closes at the deadline.</p>
-    </section>
-
-    <section class="card">
-      <h2 class="text-lg font-bold">3. Connect Google Sheet</h2>
-      <p class="text-sm text-mute mt-1 mb-4">Paste the web app URL from your Google Apps Script. You can also hard-code it as <code>WEBHOOK_URL</code> in index.html.</p>
-      <label class="label" for="webhook">Webhook URL</label>
-      <input id="webhook" data-set="webhook" class="input font-mono text-sm" inputmode="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(settings.webhook)}">
-      <div class="mt-3"><button data-act="testHook" class="btn btn-ghost">Send test row</button></div>
-      <details class="mt-5">
-        <summary class="cursor-pointer text-sm text-accent-text font-semibold">How to set up the Google Sheet</summary>
-        <ol class="mt-3 list-decimal ml-5 space-y-1.5 text-sm text-mute">
-          <li>Create a new Google Sheet.</li>
-          <li>Open <b class="text-ink">Extensions → Apps Script</b>, delete the sample code and paste the script below.</li>
-          <li>Click <b class="text-ink">Deploy → New deployment → Web app</b>. Set <b class="text-ink">Execute as: Me</b> and <b class="text-ink">Who has access: Anyone</b>.</li>
-          <li>Authorize when asked, then copy the <b class="text-ink">Web app URL</b> into the box above.</li>
-          <li>Press <b class="text-ink">Send test row</b>. If you already had an older script, replace it and choose <b class="text-ink">Deploy → Manage deployments → Edit → New version</b>.</li>
-          <li>Three tabs are created for you: <b class="text-ink">Results</b> (flagged rows go red, late rows yellow), <b class="text-ink">Answers</b> (every answer) and <b class="text-ink">Activity log</b>.</li>
-        </ol>
-        <div class="relative mt-3">
-          <button data-act="copyScript" class="btn btn-ghost absolute top-2 right-2" style="padding:.35rem .75rem">Copy</button>
-          <pre class="bg-sunk border border-line rounded-xl p-4 pt-12 text-xs overflow-x-auto text-mute">${esc(APPS_SCRIPT)}</pre>
-        </div>
-      </details>
-    </section>
-
-    <section class="card">
-      <h2 class="text-lg font-bold">4. Share with students</h2>
-      <p class="text-sm text-mute mt-1">Copies a link that contains the quiz, deadline and rules. Students open it on their own device and tap <b class="text-ink">Student</b>. Re-copy the link after changing anything above.</p>
-      <div class="mt-3"><button data-act="copyLink" class="btn btn-primary" ${q ? '' : 'disabled'}>Copy student link</button></div>
-      <p class="text-xs text-faint mt-3">The answers travel inside the link, so a determined student could decode them.</p>
-    </section>
-
-    <section class="card">
-      <div class="flex items-center justify-between gap-3 flex-wrap">
-        <h2 class="text-lg font-bold">Results on this device <span class="text-faint font-normal text-sm">(${results.length})</span></h2>
-        <div class="flex gap-2"><button data-act="exportResults" class="btn btn-ghost" ${results.length ? '' : 'disabled'}>Export Excel</button><button data-act="clearResults" class="btn btn-danger" ${results.length ? '' : 'disabled'}>Clear</button></div>
-      </div>
-      <p class="text-xs text-faint mt-1">Only attempts made on this device appear here. Your Google Sheet collects everyone's.</p>
-      ${results.length ? `<div class="mt-3 space-y-2">${resList}</div>` : '<p class="text-sm text-faint mt-3">No submissions yet.</p>'}
-      ${pending.length ? `<div class="mt-3 text-sm text-warn">${pending.length} waiting to send. <button data-act="retryNow" class="underline font-semibold">Retry now</button></div>` : ''}
-    </section>
-  </div>`;
+/* ----- teacher: dashboard ----- */
+function hwCard(h) {
+  const open = h.status === 'open';
+  return `<div class="rounded-xl border border-line bg-sunk p-4">
+    <div class="flex flex-wrap items-start justify-between gap-2">
+      <div><div class="font-semibold">${esc(h.title)}</div><div class="text-xs text-faint mt-0.5">${h.count} questions · issued ${esc(h.issued ? new Date(h.issued).toLocaleDateString() : '')}</div></div>
+      ${open ? badge('Open', 'good') : badge('Closed', 'bad')}
+    </div>
+    <div class="flex flex-wrap gap-1.5 mt-2">${h.classes.map(c => `<span class="chip">${esc(c)}</span>`).join('')}${dueChip(h)}${h.minutes ? `<span class="chip">⏱ ${h.minutes} min</span>` : ''}<span class="chip">${h.submissions} submitted</span></div>
+    <div class="flex flex-wrap gap-2 mt-3">
+      <button data-act="hwToggle" data-v="${esc(h.id)}" class="btn btn-ghost">${open ? 'Close' : 'Reopen'}</button>
+      <button data-act="hwEdit" data-v="${esc(h.id)}" class="btn btn-ghost">Edit deadline</button>
+      <button data-act="hwDelete" data-v="${esc(h.id)}" class="btn btn-danger">Delete</button>
+    </div></div>`;
 }
 
+function connectionCard() {
+  const url = API();
+  return `<section class="card">
+    <h2 class="text-lg font-bold">Google Sheet connection</h2>
+    <p class="text-sm text-mute mt-1 mb-4">Your Google Sheet stores your classes, homework and every student's score and answers. Paste the web app URL from Apps Script.</p>
+    <label class="label" for="webhook">Web app URL</label>
+    <input id="webhook" data-set="webhook" class="input font-mono text-sm" inputmode="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(url)}">
+    <div class="mt-3 flex flex-wrap gap-2"><button data-act="checkConn" class="btn btn-ghost">Check connection</button>${url ? '<button data-act="copyHook" class="btn btn-ghost">Copy line for index.html</button>' : ''}</div>
+    ${connMsg ? `<div class="mt-3 text-sm space-y-1">${connMsg}</div>` : ''}
+    ${url && url !== CONFIG.WEBHOOK_URL ? `<p class="text-xs text-warn mt-3">Students' devices only know this URL if it is in <code>WEBHOOK_URL</code> at the top of index.html. Press "Copy line for index.html", paste it there, and upload the file again.</p>` : ''}
+    <details class="mt-5" ${url ? '' : 'open'}>
+      <summary class="cursor-pointer text-sm text-accent-text font-semibold">How to set up (one time)</summary>
+      <ol class="mt-3 list-decimal ml-5 space-y-1.5 text-sm text-mute">
+        <li>Create a new Google Sheet. This is where your results will go. Keep it private.</li>
+        <li>In <b class="text-ink">that Sheet</b>, open <b class="text-ink">Extensions → Apps Script</b>, delete the sample code, press <b class="text-ink">Copy</b> below and paste.</li>
+        <li>Press <b class="text-ink">Save</b>. Choose <b class="text-ink">setup</b> in the function menu and press <b class="text-ink">Run</b>. Google asks for permission (again if you used an older script): choose your account, <b class="text-ink">Advanced → Go to project → Allow</b>. The tabs <b class="text-ink">Results, Answers, Activity log, Classes, Homework, Questions</b> appear along the bottom of that Sheet. <b class="text-ink">Sheet1 stays empty</b>, that's normal.</li>
+        <li>Click <b class="text-ink">Deploy → New deployment → Web app</b>. Set <b class="text-ink">Execute as: Me</b> and <b class="text-ink">Who has access: Anyone</b>. Copy the <b class="text-ink">Web app URL</b> into the box above.</li>
+        <li>Updating the script later: <b class="text-ink">Deploy → Manage deployments → ✏️ → Version: New version → Deploy</b>. The URL stays the same.</li>
+        <li>An older version of this script? The old tabs are kept and renamed "(old …)" automatically.</li>
+      </ol>
+      <div class="relative mt-3">
+        <button data-act="copyScript" class="btn btn-ghost absolute top-2 right-2" style="padding:.35rem .75rem">Copy</button>
+        <pre class="bg-sunk border border-line rounded-xl p-4 pt-12 text-xs overflow-x-auto text-mute max-h-80">${esc(APPS_SCRIPT)}</pre>
+      </div>
+      <p class="text-xs text-faint mt-2">The Copy button puts your teacher password into the script, so only you can manage classes and homework. Anyone can still take the quizzes.</p>
+    </details></section>`;
+}
+
+function teacherView() {
+  const hws = adminData ? adminData.homework : [];
+  const classes = adminData ? adminData.classes : [];
+  const connected = !!API();
+  let body = '';
+  if (connected) {
+    if (adminLoading && !adminData) body = spinner('Loading your classes…');
+    else if (adminErr && !adminData) body = `<section class="card"><div class="text-bad text-sm">${esc(adminErr)}</div><button data-act="reloadAdmin" class="btn btn-ghost mt-3">Try again</button></section>`;
+    else if (adminData) body = `
+      <section class="card">
+        <div class="flex items-center justify-between gap-3 flex-wrap"><h2 class="text-lg font-bold">Classes</h2>
+          ${adminData.sheetUrl ? `<a href="${esc(adminData.sheetUrl)}" target="_blank" rel="noopener" class="text-sm text-accent-text underline">Open results in Google Sheets ↗</a>` : ''}</div>
+        <div class="mt-3 flex gap-2"><input id="newClass" data-cn="1" class="input" maxlength="40" placeholder="New class name, e.g. Grade 6A" value="${esc(newClassName)}"><button data-act="saveClass" class="btn btn-primary" style="white-space:nowrap">Add class</button></div>
+        ${classes.length ? `<div class="mt-4 grid sm:grid-cols-2 gap-3">${classes.map(c => {
+          const n = hws.filter(h => h.status === 'open' && h.classes.includes(c)).length;
+          return `<div class="rounded-xl border border-line bg-sunk p-4 flex items-center justify-between gap-2">
+            <button data-act="openClass" data-v="${esc(c)}" class="text-left flex-1 min-w-0"><div class="font-semibold truncate">${esc(c)}</div><div class="text-xs text-faint">${n} open homework</div></button>
+            <button data-act="delClass" data-v="${esc(c)}" class="text-xs text-faint hover:text-bad px-2" aria-label="Delete class ${esc(c)}" title="Delete class">✕</button></div>`;
+        }).join('')}</div>` : '<p class="text-sm text-faint mt-3">No classes yet. Add your first one above.</p>'}
+      </section>
+      <section class="card">
+        <div class="flex items-center justify-between gap-3 flex-wrap"><h2 class="text-lg font-bold">Homework</h2><button data-act="newHw" class="btn btn-primary" ${classes.length ? '' : 'disabled'}>+ Issue homework</button></div>
+        ${classes.length ? '' : '<p class="text-sm text-faint mt-2">Add a class first.</p>'}
+        <div class="mt-4 space-y-3">${hws.length ? hws.map(hwCard).join('') : '<p class="text-sm text-faint">Nothing issued yet.</p>'}</div>
+      </section>`;
+  }
+  return `<div class="max-w-3xl mx-auto space-y-5"><h1 class="text-3xl font-extrabold tracking-tight text-center">Teacher</h1>
+    ${adminErr && adminData ? `<div class="rounded-xl border border-bad/40 bg-bad/10 text-bad text-sm p-3">${esc(adminErr)}</div>` : ''}
+    ${body}${connectionCard()}</div>`;
+}
+
+function classResultsHTML(name) {
+  const cr = classRes[name];
+  if (!cr || cr.loading) return spinner('Loading results…');
+  if (cr.err) return `<div class="text-bad text-sm">${esc(cr.err)}</div><button data-act="reloadResults" class="btn btn-ghost mt-3">Try again</button>`;
+  if (!cr.rows.length) return '<p class="text-sm text-faint">No submissions from this class yet.</p>';
+  return `<div class="overflow-x-auto"><table class="w-full text-sm"><thead class="text-left text-xs uppercase text-faint"><tr><th class="py-2 pr-3">Student</th><th class="py-2 pr-3">Homework</th><th class="py-2 pr-3">Score</th><th class="py-2">Notes</th></tr></thead><tbody>${cr.rows.map(r => `
+    <tr class="border-t border-line align-top">
+      <td class="py-2 pr-3 font-medium">${esc(r.name)}<div class="text-xs text-faint font-normal">${esc(fmtDate(r.ts))}</div></td>
+      <td class="py-2 pr-3 text-mute">${esc(r.hw)}</td>
+      <td class="py-2 pr-3 whitespace-nowrap">${fmt(r.score)}/${fmt(r.total)} <span class="text-faint">(${r.percent}%)</span></td>
+      <td class="py-2">${r.late ? badge('LATE', 'warn') : ''}${r.flags ? ' ' + badge('FLAGGED', 'bad') + `<div class="text-xs text-mute mt-1">${esc(r.flags)}</div>` : ''}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function classView() {
+  const hws = (adminData ? adminData.homework : []).filter(h => h.classes.includes(classViewName));
+  const sheetUrl = adminData && adminData.sheetUrl;
+  return `<div class="max-w-3xl mx-auto space-y-5">
+    <button data-act="backTeacher" class="text-sm text-accent-text underline">← All classes</button>
+    <h1 class="text-3xl font-extrabold tracking-tight">${esc(classViewName)}</h1>
+    <section class="card"><div class="flex items-center justify-between gap-3 flex-wrap"><h2 class="text-lg font-bold">Homework for this class</h2><button data-act="newHw" data-v="${esc(classViewName)}" class="btn btn-primary">+ Issue homework</button></div>
+      <div class="mt-4 space-y-3">${hws.length ? hws.map(hwCard).join('') : '<p class="text-sm text-faint">Nothing issued to this class yet.</p>'}</div></section>
+    <section class="card"><div class="flex items-center justify-between gap-3 flex-wrap"><h2 class="text-lg font-bold">Results</h2>
+      <div class="flex gap-2"><button data-act="reloadResults" class="btn btn-ghost">Refresh</button>${sheetUrl ? `<a href="${esc(sheetUrl)}" target="_blank" rel="noopener" class="btn btn-ghost">Every answer in Google Sheets ↗</a>` : ''}</div></div>
+      <div class="mt-3">${classResultsHTML(classViewName)}</div></section></div>`;
+}
+
+/* ----- teacher: issue homework ----- */
+function questionPreview(qs) {
+  return qs.map((x, i) => `
+    <li class="py-3 border-t border-line first:border-0">
+      <div class="font-medium text-sm"><span class="text-faint">${i + 1}.</span> ${esc(x.q)} <span class="text-xs text-faint">(${fmt(x.points)} pt)</span></div>
+      ${x.type === 'text' ? `<div class="mt-1.5 text-sm"><span class="text-faint">Typed answer:</span> <span class="text-good font-semibold">${x.answers.map(a => esc(a)).join(' <span class="text-faint font-normal">or</span> ')}</span></div>` : ''}
+      <ul class="mt-1.5 grid sm:grid-cols-2 gap-x-4 gap-y-0.5 text-sm">
+        ${x.options.map((o, j) => `<li class="${j === x.answer ? 'text-good font-semibold' : 'text-mute'}">${LETTERS[j]}. ${esc(o)}${j === x.answer ? ' ✓' : ''}</li>`).join('')}
+      </ul></li>`).join('');
+}
+
+function composeView() {
+  const d = draft, classes = adminData ? adminData.classes : [];
+  const chk = (key, label, full) => `<label class="flex items-center gap-3 rounded-xl bg-sunk border border-line px-4 py-3 cursor-pointer ${full ? 'sm:col-span-2' : ''}"><input type="checkbox" data-d="${key}" class="w-4 h-4" style="accent-color:rgb(var(--accent))" ${d[key] ? 'checked' : ''}> ${label}</label>`;
+  const tab = (m, t) => `<button data-act="srcMode" data-v="${m}" class="btn ${d.mode === m ? 'btn-primary' : 'btn-ghost'}" style="padding:.5rem 1rem">${t}</button>`;
+  return `<div class="max-w-3xl mx-auto space-y-5">
+    <button data-act="backTeacher" class="text-sm text-accent-text underline">← Back</button>
+    <h1 class="text-3xl font-extrabold tracking-tight">Issue homework</h1>
+    <section class="card">
+      <h2 class="text-lg font-bold">1. Questions</h2>
+      <div class="flex gap-2 mt-3">${tab('sheet', 'Google Sheet')}${tab('file', 'Upload Excel / CSV')}</div>
+      ${d.mode === 'sheet' ? `
+        <p class="text-sm text-mute mt-3">Open your quiz in Google Sheets, copy the address from the browser bar and paste it here. The first row must be the headers: <b class="text-ink">Question, Option A…, Answer, Points</b>. In <b class="text-ink">Answer</b>, type the correct option as it appears: a word, a number, or True / False / Not Given (a letter such as B also works). For True / False / Not Given questions you can leave the options empty. For a question the student <b class="text-ink">types</b> (a number or word), leave the options empty and put the answer in Answer; separate alternative answers with <b class="text-ink">|</b>. It has to be a real Google Sheet. Need a starting point? <a href="quiz-template.xlsx" download class="underline text-accent-text">Download the template</a>, upload it to Google Drive, open it and choose <b class="text-ink">File → Save as Google Sheets</b>.</p>
+        <label class="label mt-3" for="dUrl">Google Sheet link</label>
+        <input id="dUrl" data-d="url" class="input" inputmode="url" placeholder="https://docs.google.com/spreadsheets/d/…" value="${esc(d.url)}">
+        <button data-act="loadSheet" class="btn btn-ghost mt-3" ${d.loading ? 'disabled' : ''}>${d.loading ? 'Loading…' : 'Load questions'}</button>`
+      : `
+        <div class="flex items-center justify-between gap-3 flex-wrap mt-3"><p class="text-sm text-mute">Columns: <b class="text-ink">Question</b>, <b class="text-ink">Option A–H</b>, <b class="text-ink">Answer</b>, optional <b class="text-ink">Points</b>.</p><button data-act="template" class="btn btn-ghost">Download template</button></div>
+        <label id="drop" for="dfile" class="mt-3 block cursor-pointer rounded-2xl border-2 border-dashed border-line hover:border-accent transition p-8 text-center"><div class="font-semibold">Drop a spreadsheet here, or tap to choose</div><div class="text-xs text-faint mt-1">Only the first sheet is used.</div></label>
+        <input id="dfile" type="file" class="hidden" accept=".xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv">`}
+      ${d.err ? `<div class="mt-3 text-sm text-bad">${esc(d.err)}</div>` : ''}
+      ${d.questions ? `<div class="mt-4 rounded-xl border border-good/40 bg-good/5 p-3 text-sm text-good">✓ ${d.questions.length} question${d.questions.length > 1 ? 's' : ''} loaded from ${esc(d.sourceLabel)}${d.summary ? `<div class="text-xs text-mute mt-1">${esc(d.summary)}</div>` : ''}</div>
+        ${d.warnings.length ? `<div class="mt-3 rounded-xl border border-warn/40 bg-warn/10 p-3 text-sm text-warn"><b>${d.warnings.length} note${d.warnings.length > 1 ? 's' : ''} about your spreadsheet</b><ul class="list-disc ml-5 mt-1 space-y-0.5">${d.warnings.slice(0, 8).map(w => `<li>${esc(w)}</li>`).join('')}${d.warnings.length > 8 ? `<li>…and ${d.warnings.length - 8} more</li>` : ''}</ul></div>` : ''}
+        <details class="mt-3"><summary class="cursor-pointer text-sm text-accent-text font-semibold">Preview questions</summary><ul class="mt-2">${questionPreview(d.questions)}</ul></details>` : ''}
+    </section>
+    <section class="card">
+      <h2 class="text-lg font-bold">2. Details</h2>
+      <label class="label mt-3" for="dTitle">Title</label>
+      <input id="dTitle" data-d="title" class="input" maxlength="80" placeholder="e.g. Unit 3 homework" value="${esc(d.title)}">
+      <div class="label mt-4">Give it to</div>
+      <div class="grid sm:grid-cols-2 gap-2">${classes.map(c => `<label class="flex items-center gap-3 rounded-xl bg-sunk border border-line px-4 py-3 cursor-pointer"><input type="checkbox" data-dc="${esc(c)}" class="w-4 h-4" style="accent-color:rgb(var(--accent))" ${d.classes.includes(c) ? 'checked' : ''}> ${esc(c)}</label>`).join('')}</div>
+      <div class="mt-4 grid sm:grid-cols-2 gap-4">
+        <div><label class="label" for="dDl">Deadline (your local time, optional)</label><input id="dDl" data-d="deadlineLocal" type="datetime-local" class="input" value="${esc(d.deadlineLocal)}"></div>
+        <div><label class="label" for="dMin">Time limit (minutes, 0 = none)</label><input id="dMin" data-d="minutes" type="number" min="0" max="300" class="input" value="${d.minutes}"></div>
+      </div>
+      <div class="mt-4 grid sm:grid-cols-2 gap-3 text-sm">
+        ${chk('allowLate', 'Allow late submissions (marked LATE)')}${chk('blockCopy', 'Block copying &amp; right-click')}
+        ${chk('shuffleQ', 'Shuffle question order')}${chk('shuffleO', 'Shuffle answer options')}
+        ${chk('showReview', 'Show students the correct answers after they submit', true)}
+      </div>
+    </section>
+    <button data-act="issue" class="btn btn-primary w-full" style="padding:1rem;font-size:1rem" ${d.issuing ? 'disabled' : ''}>${d.issuing ? 'Issuing…' : 'Issue homework'}</button></div>`;
+}
+
+/* ----- student: quiz + result ----- */
 function quizView() {
+  const Q = attempt.quiz;
   const cards = attempt.order.map(({ qi, o }, n) => {
-    const q = quiz.questions[qi];
+    const q = Q.questions[qi];
     return `<section class="card">
       <div class="flex gap-3">
         <div class="shrink-0 w-8 h-8 rounded-lg bg-sunk border border-line grid place-items-center text-sm font-bold text-accent-text">${n + 1}</div>
         <h3 class="font-semibold text-lg leading-snug pt-0.5">${esc(q.q)}</h3>
       </div>
+      ${q.type === 'text' ? typedInput(qi) : ''}
       <div class="mt-4 space-y-2.5">
         ${o.map((oi, d) => `
           <label class="block cursor-pointer opt">
@@ -691,33 +1203,34 @@ function quizView() {
   }).join('');
   return `<div class="-mx-4 -mt-8 sm:-mt-10 px-4 py-3 sticky top-14 z-20 bg-bg/90 backdrop-blur border-b border-line">
       <div class="max-w-3xl mx-auto">
-        <div class="flex items-center justify-between text-sm gap-3"><div class="truncate"><span class="text-faint">Student</span> <b>${esc(attempt.name)}</b></div><div id="timer" class="font-mono"></div></div>
+        <div class="flex items-center justify-between text-sm gap-3"><div class="truncate"><span class="text-faint">Student</span> <b>${esc(attempt.name)}</b> <span class="text-faint">· ${esc(attempt.cls)}</span></div><div id="timer" class="font-mono"></div></div>
         <div class="mt-2 h-2 rounded-full bg-sunk border border-line overflow-hidden"><div id="bar" class="h-full bg-accent transition-all duration-300" style="width:0%"></div></div>
         <div id="progressText" class="mt-1 text-xs text-mute"></div>
       </div></div>
-    <div class="max-w-3xl mx-auto mt-6 space-y-5 ${settings.blockCopy ? 'noselect' : ''}">
-      <h1 class="text-2xl font-extrabold tracking-tight">${esc(quiz.title)}</h1>
+    <div class="max-w-3xl mx-auto mt-6 space-y-5 ${attempt.hw.blockCopy ? 'noselect' : ''}">
+      <h1 class="text-2xl font-extrabold tracking-tight">${esc(Q.title)}</h1>
+      ${Q.questions.some(q => q.type === 'text') ? `<p class="text-sm text-mute -mt-2">For typed answers, spelling counts but capital letters don't.</p>` : ''}
       ${cards}
       <button data-act="submit" class="btn btn-primary w-full" style="padding:1rem;font-size:1rem">Submit answers</button>
     </div>`;
 }
 
 function resultView() {
-  const r = lastReview.rec;
+  const r = lastReview.rec, Q = lastReview.quiz;
   const col = r.percent >= 80 ? 'good' : r.percent >= 50 ? 'warn' : 'bad';
   const C = 2 * Math.PI * 52;
   const msg = r.percent >= 90 ? 'Outstanding!' : r.percent >= 75 ? 'Great work!' : r.percent >= 50 ? 'Good effort. Keep practising.' : 'Keep going. Review and try again.';
-  const review = settings.showReview ? lastReview.order.map(({ qi }, n) => {
-    const q = quiz.questions[qi]; const given = lastReview.answers[qi]; const ok = given === q.answer;
+  const review = lastReview.hw.showReview ? lastReview.order.map(({ qi }, n) => {
+    const q = Q.questions[qi]; const given = lastReview.answers[qi]; const ok = isRight(q, given), isT = q.type === 'text';
     return `<li class="rounded-xl border ${ok ? 'border-good/40 bg-good/5' : 'border-bad/40 bg-bad/5'} p-4">
       <div class="font-medium text-sm"><span class="text-faint">${n + 1}.</span> ${esc(q.q)}</div>
-      <div class="mt-2 text-sm ${ok ? 'text-good' : 'text-bad'}">${ok ? '✓' : '✗'} Your answer: ${given === undefined ? '<i>no answer</i>' : esc(q.options[given])}</div>
-      ${ok ? '' : `<div class="mt-1 text-sm text-good">Correct answer: ${esc(q.options[q.answer])}</div>`}
+      <div class="mt-2 text-sm ${ok ? 'text-good' : 'text-bad'}">${ok ? '✓' : '✗'} Your answer: ${given === undefined ? '<i>no answer</i>' : esc(isT ? given : q.options[given])}</div>
+      ${ok ? '' : `<div class="mt-1 text-sm text-good">Correct answer: ${esc(isT ? q.answers.join(' / ') : q.options[q.answer])}</div>`}
     </li>`;
   }).join('') : '';
   return `<div class="max-w-2xl mx-auto">
     <section class="card text-center">
-      <div class="text-sm text-mute">${esc(r.name)}</div>
+      <div class="text-sm text-mute">${esc(r.name)} · ${esc(r.cls)}</div>
       <div class="relative w-40 h-40 mx-auto mt-3">
         <svg viewBox="0 0 120 120" class="w-40 h-40 -rotate-90"><circle cx="60" cy="60" r="52" fill="none" stroke="rgb(var(--line))" stroke-width="10"/><circle cx="60" cy="60" r="52" fill="none" stroke="rgb(var(--${col}))" stroke-width="10" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - r.percent / 100)}"/></svg>
         <div class="absolute inset-0 grid place-items-center"><div class="text-4xl font-extrabold">${r.percent}%</div></div>
@@ -753,13 +1266,33 @@ function renderSettings() {
   </div>`;
 }
 
-/* ---------- quiz flow ---------- */
-function startAttempt(name) {
-  if (isClosed()) return toast('This quiz is closed.', 'error');
-  const idx = quiz.questions.map((_, i) => i);
-  if (settings.shuffleQ) shuffle(idx);
-  const order = idx.map(qi => { const o = quiz.questions[qi].options.map((_, i) => i); if (settings.shuffleO) shuffle(o); return { qi, o }; });
-  attempt = { name, order, answers: {}, startedAt: Date.now(), lastSeen: Date.now(), sig: quizSig(), done: false, stats: newStats(), log: [] };
+/* ---------- student: start, timer, submit ---------- */
+async function loadClasses() {
+  if (!API()) { render(); return; }
+  classesLoading = true; classesErr = ''; if (view === 'studentStart' && !classesData) render();
+  try { const j = await apiGet({ action: 'classes' }); classesData = j.classes; LS.set('rca.classes', classesData); }
+  catch (e) { classesErr = friendlyErr(e); }
+  classesLoading = false; if (view === 'studentStart') render();
+}
+async function startHw(id) {
+  if (stuName.trim().length < 2) return toast('Please enter your name.', 'error');
+  if (!stuClass) return toast('Choose your class.', 'error');
+  const saved = LS.get('rca.attempt', null);
+  if (saved && !saved.done && saved.quiz && !confirm('Starting a new quiz will replace the unfinished one. Continue?')) return;
+  starting = id; render();
+  try {
+    const j = await apiGet({ action: 'quiz', id });
+    if (isClosed(j.hw)) throw new Error('This homework is closed.');
+    if (!j.questions.length) throw new Error('This homework has no questions.');
+    starting = '';
+    startAttempt(stuName.trim().replace(/\s+/g, ' '), stuClass, j.hw, j.questions);
+  } catch (e) { starting = ''; toast(friendlyErr(e), 'error'); render(); }
+}
+function startAttempt(name, cls, hw, questions) {
+  const idx = questions.map((_, i) => i);
+  if (hw.shuffleQ) shuffle(idx);
+  const order = idx.map(qi => { const o = questions[qi].options.map((_, i) => i); if (hw.shuffleO) shuffle(o); return { qi, o }; });
+  attempt = { name, cls, hw, quiz: { title: hw.title, questions }, order, answers: {}, startedAt: Date.now(), lastSeen: Date.now(), done: false, stats: newStats(), log: [] };
   attempt.log.push({ t: 0, type: 'started', detail: navigator.userAgent.slice(0, 120) });
   saveAttempt(); leaveStart = null; view = 'quiz'; render();
 }
@@ -771,9 +1304,9 @@ function updateProgress() {
   if (txt) txt.textContent = `${n} of ${total} answered`;
 }
 function endTime() {
-  let end = Infinity;
-  if (settings.minutes) end = attempt.startedAt + settings.minutes * 60000;
-  if (dlTime() && !settings.allowLate) end = Math.min(end, dlTime());
+  const hw = attempt.hw; let end = Infinity;
+  if (hw.minutes) end = attempt.startedAt + hw.minutes * 60000;
+  if (dlTime(hw) && !hw.allowLate) end = Math.min(end, dlTime(hw));
   return end;
 }
 function startTimer() {
@@ -782,7 +1315,8 @@ function startTimer() {
   const end = endTime();
   const tick = () => {
     if (!attempt) return clearInterval(timerId);
-    if (end === Infinity) { el.textContent = dlTime() ? (isPast() ? 'LATE' : 'Due ' + fmtDate(settings.deadline)) : ''; el.className = 'font-mono ' + (isPast() ? 'text-warn' : 'text-mute'); return; }
+    const hw = attempt.hw;
+    if (end === Infinity) { el.textContent = dlTime(hw) ? (isPast(hw) ? 'LATE' : 'Due ' + fmtDate(hw.deadline)) : ''; el.className = 'font-mono ' + (isPast(hw) ? 'text-warn' : 'text-mute'); return; }
     const left = Math.max(0, end - Date.now());
     el.textContent = '⏱ ' + Math.floor(left / 60000) + ':' + String(Math.floor(left % 60000 / 1000)).padStart(2, '0');
     el.className = 'font-mono ' + (left < 60000 ? 'text-bad' : '');
@@ -796,41 +1330,41 @@ function submitQuiz(auto) {
   const unanswered = attempt.order.length - Object.keys(attempt.answers).length;
   if (!auto && unanswered > 0 && !confirm(`You have ${unanswered} unanswered question${unanswered > 1 ? 's' : ''}. Submit anyway?`)) return;
   onReturn();
+  const Q = attempt.quiz, hw = attempt.hw;
   const seconds = Math.round((Date.now() - attempt.startedAt) / 1000);
-  const late = !!(dlTime() && Date.now() > dlTime() + 1000);
+  const late = !!(dlTime(hw) && Date.now() > dlTime(hw) + 1000);
   let score = 0, total = 0, correct = 0;
   const answers = [];
   attempt.order.forEach(({ qi }) => {
-    const q = quiz.questions[qi]; total += q.points;
-    const g = attempt.answers[qi], ok = g === q.answer;
+    const q = Q.questions[qi]; total += q.points;
+    const g = attempt.answers[qi], ok = isRight(q, g), isT = q.type === 'text';
     if (ok) { score += q.points; correct++; }
-    answers.push({ n: qi + 1, q: q.q, chosen: g === undefined ? '(no answer)' : q.options[g], correctAnswer: q.options[q.answer], ok, points: q.points, earned: ok ? q.points : 0 });
+    answers.push({ n: qi + 1, q: q.q, chosen: g === undefined ? '(no answer)' : isT ? String(g).trim() : q.options[g], correctAnswer: isT ? q.answers.join(' / ') : q.options[q.answer], ok, points: q.points, earned: ok ? q.points : 0 });
   });
   answers.sort((a, b) => a.n - b.n);
   ev('submitted', auto ? 'auto-submitted (time up)' : '');
   attempt.done = true; clearInterval(timerId); clearInterval(beatId);
   const integrity = integrityOf(attempt, seconds);
   const rec = {
-    id: uid(), timestamp: new Date().toISOString(), name: attempt.name, quiz: quiz.title,
+    id: uid(), timestamp: new Date().toISOString(), name: attempt.name, cls: attempt.cls, hwId: hw.id, quiz: Q.title,
     score: +score.toFixed(2), total: +total.toFixed(2), percent: total ? Math.round(score / total * 100) : 0,
-    correct, questions: attempt.order.length, seconds, late, deadline: settings.deadline || '', integrity, log: attempt.log, answers, sent: false
+    correct, questions: attempt.order.length, seconds, late, deadline: hw.deadline || '', integrity, log: attempt.log, answers, sent: false
   };
-  results.unshift(rec); LS.set('rca.results', results);
-  lastReview = { order: attempt.order, answers: attempt.answers, rec };
+  results.unshift(rec); results = results.slice(0, 50); LS.set('rca.results', results);
+  lastReview = { order: attempt.order, answers: attempt.answers, rec, quiz: Q, hw };
   LS.del('rca.attempt');
   attempt = null; view = 'result'; render(); deliver(rec);
 }
 
-/* ---------- teacher login ---------- */
-function lockInfo() { const f = LS.get('rca.fails', { n: 0, until: 0 }); return f; }
+/* ---------- teacher: login + data ---------- */
 function doUnlock() {
   const msg = $('#loginMsg'), pw = $('#pwIn').value;
-  const f = lockInfo();
+  const f = LS.get('rca.fails', { n: 0, until: 0 });
   if (Date.now() < f.until) { msg.textContent = `Too many attempts. Try again in ${Math.ceil((f.until - Date.now()) / 1000)}s.`; return; }
   if (!pw) { msg.textContent = 'Enter the password.'; return; }
   msg.textContent = 'Checking…';
   setTimeout(() => {
-    if (hashPw(pw) === CONFIG.TEACHER_PASSWORD_HASH) { LS.del('rca.fails'); unlocked = true; view = 'teacher'; render(); }
+    if (hashPw(pw) === CONFIG.TEACHER_PASSWORD_HASH) { LS.del('rca.fails'); unlocked = true; teacherPw = pw; view = 'teacher'; render(); refreshAdmin(); }
     else {
       const n = f.n + 1, wait = n >= 3 ? Math.min(300, 10 * Math.pow(2, n - 3)) : 0;
       LS.set('rca.fails', { n, until: wait ? Date.now() + wait * 1000 : 0 });
@@ -839,108 +1373,220 @@ function doUnlock() {
     }
   }, 30);
 }
+const inTeacher = () => ['teacher', 'classView', 'compose'].includes(view);
+async function refreshAdmin() {
+  if (!API()) { render(); return; }
+  adminLoading = true; adminErr = ''; if (inTeacher()) render();
+  try { adminData = await admin('adminList'); } catch (e) { adminErr = friendlyErr(e); }
+  adminLoading = false; if (inTeacher()) render();
+}
+async function adminDo(fn, okMsg) {
+  try { const r = await fn(); if (okMsg) toast(okMsg); return r; }
+  catch (e) { toast(friendlyErr(e), 'error'); return null; }
+}
+async function checkConn() {
+  if (!API()) { connMsg = msgBad('Paste the web app URL first.'); render(); return; }
+  connMsg = '<div class="text-mute">Checking…</div>'; render();
+  const lines = [];
+  try { const j = await apiGet({ action: 'ping' }); lines.push(msgOk(`Connected to the Google script (version ${j.version}).`)); }
+  catch (e) { connMsg = msgBad(friendlyErr(e)); render(); return; }
+  try { await admin('adminPing'); lines.push(msgOk('The teacher password matches the script.')); refreshAdmin(); }
+  catch (e) { lines.push(msgBad(friendlyErr(e))); }
+  connMsg = lines.join(''); render();
+}
+
+async function loadClassResults(name) {
+  classRes[name] = { loading: true, rows: [], err: '' }; if (view === 'classView' && classViewName === name) render();
+  try { const j = await admin('classResults', { name }); classRes[name] = { loading: false, rows: j.results, err: '' }; }
+  catch (e) { classRes[name] = { loading: false, rows: [], err: friendlyErr(e) }; }
+  if (view === 'classView' && classViewName === name) render();
+}
+
+/* ---------- teacher: issue homework ---------- */
+const newDraft = cls => ({ mode: 'sheet', url: '', title: '', questions: null, warnings: [], summary: '', source: '', sourceLabel: '', err: '', classes: cls ? [cls] : [], deadlineLocal: '', allowLate: true, minutes: 0, shuffleQ: false, shuffleO: false, showReview: false, blockCopy: true, loading: false, issuing: false });
+async function loadSheet() {
+  const d = draft;
+  if (!d.url.trim()) { d.err = 'Paste the link to your Google Sheet first.'; render(); return; }
+  d.loading = true; d.err = ''; render();
+  try {
+    const j = await admin('readSheet', { url: d.url.trim() });
+    const { questions, warnings, summary } = parseRows(j.rows);
+    if (!questions.length) throw new Error('No valid questions found. ' + (warnings[0] || ''));
+    d.questions = questions; d.warnings = warnings; d.summary = summary; d.source = d.url.trim();
+    d.sourceLabel = '"' + j.title + '"' + (j.tab ? ' (tab ' + j.tab + ')' : '');
+    if (!d.title) d.title = j.title;
+  } catch (e) { d.err = friendlyErr(e); d.questions = null; }
+  d.loading = false; if (view === 'compose') render();
+}
+async function handleDraftFile(f) {
+  if (!f || !draft) return;
+  try {
+    const { questions, warnings, summary } = parseWorkbook(await f.arrayBuffer());
+    if (!questions.length) throw new Error('No valid questions found. ' + (warnings[0] || ''));
+    draft.questions = questions; draft.warnings = warnings; draft.summary = summary; draft.err = ''; draft.source = 'file: ' + f.name; draft.sourceLabel = f.name;
+    if (!draft.title) draft.title = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+  } catch (e) { draft.err = e.message || 'Could not read that file.'; draft.questions = null; }
+  render();
+}
+async function issueHw() {
+  const d = draft;
+  if (!d.questions) return toast('Load the questions first.', 'error');
+  if (!d.title.trim()) return toast('Give the homework a title.', 'error');
+  if (!d.classes.length) return toast('Pick at least one class.', 'error');
+  d.issuing = true; render();
+  try {
+    await admin('issue', { title: d.title, classes: d.classes, questions: d.questions, deadline: d.deadlineLocal ? new Date(d.deadlineLocal).toISOString() : '', allowLate: d.allowLate, minutes: d.minutes, shuffleQ: d.shuffleQ, shuffleO: d.shuffleO, showReview: d.showReview, blockCopy: d.blockCopy, source: d.source });
+    toast(`Homework issued to ${d.classes.length} class${d.classes.length > 1 ? 'es' : ''}`);
+    const back = window.__fromClass ? 'classView' : 'teacher';
+    draft = null; window.__fromClass = false; view = back; render(); refreshAdmin();
+    if (back === 'classView') loadClassResults(classViewName);
+  } catch (e) { d.issuing = false; toast(friendlyErr(e), 'error'); render(); }
+}
+function openEdit(id) {
+  const h = (adminData ? adminData.homework : []).find(x => x.id === id); if (!h) return;
+  closeModal();
+  const ov = document.createElement('div'); ov.id = 'modalOv'; ov.className = 'fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-4';
+  ov.innerHTML = `<div class="card w-full max-w-sm" role="dialog" aria-label="Edit homework">
+    <h2 class="text-lg font-bold">${esc(h.title)}</h2>
+    <label class="label mt-4" for="eDl">Deadline (your local time)</label><input id="eDl" type="datetime-local" class="input" value="${esc(toLocalInput(h.deadline))}">
+    <label class="label mt-4" for="eMin">Time limit (minutes, 0 = none)</label><input id="eMin" type="number" min="0" max="300" class="input" value="${h.minutes}">
+    <label class="flex items-center gap-3 rounded-xl bg-sunk border border-line px-4 py-3 cursor-pointer mt-4 text-sm"><input id="eLate" type="checkbox" class="w-4 h-4" style="accent-color:rgb(var(--accent))" ${h.allowLate ? 'checked' : ''}> Allow late submissions</label>
+    <div class="flex gap-2 mt-5"><button data-act="closeModal" class="btn btn-ghost flex-1">Cancel</button><button data-act="saveEdit" data-v="${esc(h.id)}" class="btn btn-primary flex-1">Save</button></div></div>`;
+  document.body.appendChild(ov);
+}
+function closeModal() { const o = $('#modalOv'); if (o) o.remove(); }
 
 /* ---------- render + events ---------- */
 function render() {
   clearInterval(timerId); clearInterval(beatId);
-  if (view === 'teacher' && !unlocked) view = 'teacherLogin';
-  const views = { home: homeView, studentStart: studentStartView, teacherLogin: loginView, hashtool: hashToolView, teacher: teacherView, quiz: quizView, result: resultView };
+  if (['teacher', 'classView', 'compose'].includes(view) && !unlocked) view = 'teacherLogin';
+  const views = { home: homeView, studentStart: studentStartView, teacherLogin: loginView, hashtool: hashToolView, teacher: teacherView, classView, compose: composeView, quiz: quizView, result: resultView };
+  const ae = document.activeElement, aid = ae && ae.id && ae.closest && ae.closest('#app') ? ae.id : '', apos = aid && ae.selectionStart !== undefined ? ae.selectionStart : null;
   const h = $('#hdr'); const hh = headerHTML(); h.innerHTML = hh; h.classList.toggle('hidden', !hh);
   $('#app').innerHTML = views[view]();
-  window.scrollTo(0, 0);
+  if (view !== lastView) window.scrollTo(0, 0);
+  lastView = view;
+  if (aid) { const el = document.getElementById(aid); if (el) { el.focus(); if (apos !== null) { try { el.setSelectionRange(apos, apos); } catch {} } } }
   if (view === 'quiz') { updateProgress(); startTimer(); startBeat(); }
-  if (view === 'teacherLogin') { const p = $('#pwIn'); if (p) p.focus(); }
+  if (view === 'teacherLogin' && !aid) { const p = $('#pwIn'); if (p) p.focus(); }
 }
 
 document.addEventListener('click', async e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
-  const act = b.dataset.act;
+  const act = b.dataset.act, v = b.dataset.v;
   switch (act) {
     case 'home': view = 'home'; render(); break;
-    case 'goStudent': view = 'studentStart'; render(); break;
-    case 'goTeacher': view = unlocked ? 'teacher' : 'teacherLogin'; render(); break;
+    case 'goStudent': view = 'studentStart'; render(); loadClasses(); break;
+    case 'reloadClasses': loadClasses(); break;
+    case 'startHw': startHw(v); break;
+    case 'goTeacher': view = unlocked ? 'teacher' : 'teacherLogin'; render(); if (unlocked && !adminData) refreshAdmin(); break;
     case 'unlock': doUnlock(); break;
     case 'togglePw': { const p = $('#pwIn'); p.type = p.type === 'password' ? 'text' : 'password'; b.textContent = p.type === 'password' ? 'Show' : 'Hide'; break; }
-    case 'lock': unlocked = false; view = 'home'; render(); break;
-    case 'makeHash': { const v = $('#hashIn').value; if (!v) return toast('Type a password first.', 'error'); $('#hashOut').textContent = "TEACHER_PASSWORD_HASH: '" + hashPw(v) + "',"; break; }
-    case 'start': {
-      const name = ($('#name').value || '').trim().replace(/\s+/g, ' ');
-      if (name.length < 2) { toast('Please enter your name.', 'error'); $('#name').focus(); return; }
-      startAttempt(name); break;
-    }
+    case 'lock': unlocked = false; teacherPw = ''; adminData = null; classRes = {}; draft = null; view = 'home'; render(); break;
+    case 'makeHash': { const t = $('#hashIn').value; if (!t) return toast('Type a password first.', 'error'); $('#hashOut').textContent = "TEACHER_PASSWORD_HASH: '" + hashPw(t) + "',"; break; }
     case 'resume': {
       const saved = LS.get('rca.attempt', null);
-      if (!saved || !quiz || saved.sig !== quizSig()) { LS.del('rca.attempt'); view = 'studentStart'; render(); return; }
+      if (!saved || !saved.quiz) { LS.del('rca.attempt'); render(); return; }
       attempt = saved; leaveStart = null; resumeAttempt(); view = 'quiz'; render(); break;
     }
     case 'exitQuiz':
       if (!confirm('Leave the quiz? The timer keeps running, and leaving is reported to your teacher.')) return;
-      ev('exited to menu', ''); saveAttempt(); attempt.lastSeen = Date.now(); saveAttempt(); attempt = null; view = 'home'; render(); break;
+      ev('exited to menu', ''); attempt.lastSeen = Date.now(); saveAttempt(); attempt = null; view = 'home'; render(); break;
     case 'submit': submitQuiz(false); break;
     case 'template': downloadTemplate(); break;
-    case 'exportResults': exportResults(); break;
-    case 'clearQuiz': if (confirm('Remove the current quiz?')) { quiz = null; lastWarnings = []; LS.del('rca.quiz'); render(); } break;
-    case 'clearDeadline': settings.deadline = ''; saveSettings(); render(); break;
-    case 'clearResults': if (confirm('Clear all results stored on this device? Scores already in your Google Sheet are not affected.')) { results = []; pending = []; LS.set('rca.results', results); LS.set('rca.pending', pending); render(); } break;
-    case 'copyLink': copyLink(); break;
-    case 'copyScript': toast((await copyText(APPS_SCRIPT)) ? 'Script copied' : 'Could not copy', ''); break;
+    case 'reloadAdmin': refreshAdmin(); break;
+    case 'checkConn': checkConn(); break;
+    case 'copyHook': toast((await copyText("WEBHOOK_URL: '" + API() + "',")) ? 'Copied. Paste it over the WEBHOOK_URL line in index.html.' : 'Could not copy', ''); break;
+    case 'copyScript': toast((await copyText(scriptWithPassword())) ? (teacherPw ? 'Script copied, with your password filled in' : 'Script copied') : 'Could not copy', ''); break;
+    case 'saveClass': {
+      const r = await adminDo(() => admin('addClass', { name: newClassName }), 'Class added');
+      if (r) { newClassName = ''; adminData.classes = r.classes; render(); }
+      break;
+    }
+    case 'delClass':
+      if (!confirm(`Delete the class "${v}"? Homework already issued stays in your Sheet, but students will no longer see it under this class.`)) return;
+      if (await adminDo(() => admin('deleteClass', { name: v }), 'Class deleted')) refreshAdmin();
+      break;
+    case 'openClass': classViewName = v; view = 'classView'; render(); loadClassResults(v); break;
+    case 'reloadResults': loadClassResults(classViewName); break;
+    case 'backTeacher': draft = null; view = window.__fromClass ? 'classView' : 'teacher'; window.__fromClass = false; render(); if (view === 'teacher') refreshAdmin(); break;
+    case 'newHw': window.__fromClass = view === 'classView'; draft = newDraft(v || ''); view = 'compose'; render(); break;
+    case 'srcMode': draft.mode = v; draft.err = ''; render(); break;
+    case 'loadSheet': loadSheet(); break;
+    case 'issue': issueHw(); break;
+    case 'hwToggle': {
+      const h = adminData.homework.find(x => x.id === v);
+      if (await adminDo(() => admin('updateHw', { id: v, status: h.status === 'open' ? 'closed' : 'open' }), h.status === 'open' ? 'Homework closed' : 'Homework reopened')) refreshAdmin();
+      break;
+    }
+    case 'hwDelete':
+      if (!confirm('Delete this homework? Students will no longer see it. Submitted results stay in your Google Sheet.')) return;
+      if (await adminDo(() => admin('deleteHw', { id: v }), 'Homework deleted')) refreshAdmin();
+      break;
+    case 'hwEdit': openEdit(v); break;
+    case 'closeModal': closeModal(); break;
+    case 'saveEdit': {
+      const dl = $('#eDl').value;
+      const ok = await adminDo(() => admin('updateHw', { id: v, deadline: dl ? new Date(dl).toISOString() : '', minutes: Math.max(0, Math.min(300, parseInt($('#eMin').value, 10) || 0)), allowLate: $('#eLate').checked }), 'Saved');
+      if (ok) { closeModal(); refreshAdmin(); }
+      break;
+    }
     case 'retryNow': {
       b.disabled = true; await retryPending();
       if (view === 'result' && lastReview) setStatus(lastReview.rec.sent ? 'sent' : 'failed');
-      else toast(pending.length ? 'Still could not send. Check the webhook URL and connection.' : 'All scores sent.', pending.length ? 'error' : '');
-      break;
-    }
-    case 'testHook': {
-      if (!settings.webhook) return toast('Paste the webhook URL first.', 'error');
-      const rec = { id: uid(), timestamp: new Date().toISOString(), name: "Test (Rob's Class App)", quiz: quiz ? quiz.title : 'Test', score: 1, total: 1, percent: 100, correct: 1, questions: 1, seconds: 0, late: false, integrity: { flagged: false, summary: 'No issues detected' }, log: [{ t: 0, type: 'test', detail: 'webhook test' }], answers: [{ n: 1, q: 'Test question', chosen: 'A', correctAnswer: 'A', ok: true, points: 1, earned: 1 }] };
-      const r = await sendResult(rec);
-      toast(r === 'sent' ? 'Test sent. Check your Google Sheet for a new row.' : 'Could not reach the webhook.', r === 'sent' ? '' : 'error');
+      else toast(pending.length ? 'Still could not send. Check your connection.' : 'All scores sent.', pending.length ? 'error' : '');
       break;
     }
     case 'openSettings': openSettings(); break;
     case 'closeSettings': closeSettings(); break;
-    case 'setMode': saveTheme({ ...getTheme(), mode: b.dataset.v }); renderSettings(); break;
-    case 'setAccent': saveTheme({ ...getTheme(), accent: b.dataset.v }); renderSettings(); break;
+    case 'setMode': saveTheme({ ...getTheme(), mode: v }); renderSettings(); break;
+    case 'setAccent': saveTheme({ ...getTheme(), accent: v }); renderSettings(); break;
     case 'install': if (deferredInstall) { deferredInstall.prompt(); deferredInstall = null; } break;
   }
 });
-document.addEventListener('mousedown', e => { if (e.target.id === 'settingsOv') closeSettings(); });
+document.addEventListener('mousedown', e => { if (e.target.id === 'settingsOv') closeSettings(); if (e.target.id === 'modalOv') closeModal(); });
 document.addEventListener('input', e => {
-  const k = e.target.dataset && e.target.dataset.set; if (!k) return;
-  if (k === 'customAccent') { saveTheme({ ...getTheme(), accent: e.target.value }); return; }
-  let v = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
-  if (k === 'title') { if (quiz) { quiz.title = v; saveQuiz(); } return; }
-  if (k === 'minutes') v = Math.max(0, Math.min(300, parseInt(v, 10) || 0));
-  if (k === 'webhook') v = v.trim();
-  if (k === 'deadline') v = v ? new Date(v).toISOString() : '';
-  settings[k] = v; saveSettings();
+  const t = e.target, ds = t.dataset || {};
+  if (ds.t !== undefined && attempt) {   // a typed answer
+    const qi = +ds.t, v = t.value;
+    if (v.trim()) attempt.answers[qi] = v; else delete attempt.answers[qi];
+    clearTimeout(typeTimer); typeTimer = setTimeout(saveAttempt, 400); updateProgress(); return;
+  }
+  if (ds.set === 'customAccent') { saveTheme({ ...getTheme(), accent: t.value }); return; }
+  if (ds.set === 'webhook') { settings.webhook = t.value.trim(); saveSettings(); return; }
+  if (ds.d && draft) draft[ds.d] = t.type === 'checkbox' ? t.checked : t.type === 'number' ? Math.max(0, Math.min(300, parseInt(t.value, 10) || 0)) : t.value;
+  if (ds.st === 'name') { stuName = t.value; LS.set('rca.stuName', stuName); }
+  if (ds.cn !== undefined) newClassName = t.value;
 });
 document.addEventListener('change', e => {
-  if (e.target.dataset && e.target.dataset.set === 'customAccent') renderSettings();
-  if (e.target.id === 'file') { handleFile(e.target.files[0]); e.target.value = ''; return; }
-  const t = e.target;
+  const t = e.target, ds = t.dataset || {};
+  if (ds.set === 'customAccent') renderSettings();
+  if (t.id === 'dfile') { handleDraftFile(t.files[0]); t.value = ''; return; }
+  if (ds.dc !== undefined && draft) { draft.classes = draft.classes.filter(c => c !== ds.dc); if (t.checked) draft.classes.push(ds.dc); }
+  if (ds.st === 'cls') { stuClass = t.value; LS.set('rca.stuClass', stuClass); render(); }
   if (t.matches && t.matches('input[type=radio][data-q]') && attempt) {
     attempt.answers[+t.dataset.q] = +t.value; saveAttempt(); updateProgress();
   }
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeSettings();
+  if (e.key === 'Escape') { closeSettings(); closeModal(); }
   if (e.key !== 'Enter') return;
-  if (e.target.id === 'name') $('[data-act="start"]').click();
   if (e.target.id === 'pwIn') $('[data-act="unlock"]').click();
+  if (e.target.id === 'newClass') $('[data-act="saveClass"]').click();
+  if (e.target.id === 'dUrl') $('[data-act="loadSheet"]').click();
 });
 ['dragover', 'dragenter'].forEach(ev => document.addEventListener(ev, e => { if (e.target.closest && e.target.closest('#drop')) { e.preventDefault(); $('#drop').classList.add('border-accent'); } }));
-['dragleave', 'drop'].forEach(ev => document.addEventListener(ev, e => { const d = e.target.closest && e.target.closest('#drop'); if (d) { e.preventDefault(); d.classList.remove('border-accent'); if (ev === 'drop') handleFile(e.dataTransfer.files[0]); } }));
+['dragleave', 'drop'].forEach(ev => document.addEventListener(ev, e => { const d = e.target.closest && e.target.closest('#drop'); if (d) { e.preventDefault(); d.classList.remove('border-accent'); if (ev === 'drop') handleDraftFile(e.dataTransfer.files[0]); } }));
 window.addEventListener('online', retryPending);
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; });
 
 /* ---------- boot ---------- */
-(async function init() {
+(function init() {
   installGuards();
   if (location.hash === '#hash') view = 'hashtool';
-  await loadFromHash();
   const saved = LS.get('rca.attempt', null);
-  if (saved && (saved.done || !quiz || saved.sig !== quizSig() || Date.now() - saved.startedAt > 12 * 3600 * 1000)) LS.del('rca.attempt');
+  if (saved && (saved.done || !saved.quiz || !saved.hw || Date.now() - saved.startedAt > 12 * 3600 * 1000)) LS.del('rca.attempt');
+  LS.del('rca.quiz');
   render();
   retryPending();
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
