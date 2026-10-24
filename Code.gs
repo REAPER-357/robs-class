@@ -1,9 +1,9 @@
-// Rob's Class App: Google Sheets backend (version 3)
+// Rob's Class: Google Sheets backend (version 4)
 // Paste this whole script into Extensions > Apps Script (from inside the Google Sheet you want to use).
 
 // Same password you use for the Teacher button. The app's "Copy" button fills this in for you.
 var TEACHER_PASSWORD = 'YOUR_PASSWORD_HERE';
-var VERSION = 3;
+var VERSION = 4;
 
 var H_RESULTS = ['Timestamp', 'Name', 'Class', 'Homework', 'Score', 'Total', 'Percent', 'Late', 'Flags', 'Seconds', 'HW ID', 'ID'];
 var H_ANSWERS = ['ID', 'Name', 'Quiz', '#', 'Question', 'Student answer', 'Correct answer', 'Correct?', 'Points'];
@@ -13,12 +13,13 @@ var H_HW = ['ID', 'Title', 'Classes', 'Deadline', 'Allow late', 'Minutes', 'Shuf
 var H_Q = ['HW ID', '#', 'Question', 'Options', 'Answer', 'Points'];
 
 // Actions that change the Sheet. They run one at a time so two students submitting together can't collide.
-var WRITE_ACTIONS = { submit: 1, addClass: 1, deleteClass: 1, issue: 1, updateHw: 1, deleteHw: 1 };
+// (classResults is here because it makes the class's results Sheet the first time it is opened.)
+var WRITE_ACTIONS = { submit: 1, addClass: 1, deleteClass: 1, issue: 1, updateHw: 1, deleteHw: 1, classResults: 1 };
 
 // ---------- entry points ----------
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.action) return ContentService.createTextOutput("Rob's Class App webhook is live (v" + VERSION + ")");
+  if (!p.action) return ContentService.createTextOutput("Rob's Class webhook is live (v" + VERSION + ")");
   try {
     if (p.action === 'ping') return json_({ ok: true, version: VERSION });
     if (p.action === 'classes') return json_({ ok: true, classes: publicClasses_() });
@@ -46,7 +47,6 @@ function doPost(e) {
         case 'adminPing': return json_({ ok: true, version: VERSION });
         case 'adminList': return json_(adminList_());
         case 'readSheet': return json_(readSheet_(d.url));
-        case 'classResults': return json_(classResults_(d.name));
       }
       return json_({ ok: false, error: 'Unknown action' });
     }
@@ -65,6 +65,7 @@ function doPost(e) {
         case 'issue': return json_(issue_(d));
         case 'updateHw': return json_(updateHw_(d));
         case 'deleteHw': return json_(deleteHw_(d.id));
+        case 'classResults': return json_(classResults_(d.name));
       }
     } finally {
       lock.releaseLock();
@@ -101,8 +102,8 @@ function ss_() {
 
 // Finds a tab (creating it with a header row if needed). If an older tab with the same name has
 // different columns, it is renamed "(old ...)" and a fresh one is made, so nothing is lost.
-function sheet_(name, headers, asText) {
-  var ss = ss_();
+function sheet_(name, headers, asText, target) {
+  var ss = target || ss_();
   var sh = ss.getSheetByName(name);
   if (sh && sh.getLastRow() > 0) {
     var cur = sh.getRange(1, 1, 1, headers.length).getValues()[0].join('|');
@@ -158,13 +159,60 @@ function checkPassword_(pw) {
   }
 }
 
+// ---------- one results Sheet per class ----------
+// Each class gets its own Google Sheet (made in your Drive the first time it is needed) holding
+// that class's Results, Answers and Activity log tabs. The link between a class and its Sheet is
+// kept in the script's own storage, so the Classes tab stays as it was.
+function props_() {
+  return PropertiesService.getScriptProperties();
+}
+
+function classKey_(name) {
+  return 'rs:' + String(name).toLowerCase();
+}
+
+// the class name as it is written in the Classes tab, or '' if there is no such class
+function knownClass_(name) {
+  var want = String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  var list = classNames_();
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].toLowerCase() === want) return list[i];
+  }
+  return '';
+}
+
+// the class's results Sheet if it already exists, otherwise null (never creates one)
+function classSsIfAny_(name) {
+  var id = props_().getProperty(classKey_(name));
+  if (!id) return null;
+  try { return SpreadsheetApp.openById(id); } catch (err) { return null; }
+}
+
+// the class's results Sheet, created if it does not exist yet
+function classSs_(name) {
+  var ss = classSsIfAny_(name);
+  if (ss) return ss;
+  ss = SpreadsheetApp.create("Rob's Class - " + name + ' - results');
+  props_().setProperty(classKey_(name), ss.getId());
+  var first = ss.getSheets()[0];
+  sheet_('Results', H_RESULTS, false, ss);
+  sheet_('Answers', H_ANSWERS, false, ss);
+  sheet_('Activity log', H_LOG, false, ss);
+  try { if (first && first.getName() !== 'Results') ss.deleteSheet(first); } catch (err) { /* the empty first tab can stay */ }
+  return ss;
+}
+
 // ---------- results from students ----------
 function saveResult_(d) {
   var name = safe_(cap_(d.name, 60).replace(/\s+/g, ' ').trim());
   var id = cap_(d.id, 40);
   if (!name || !id) throw new Error('Missing name or id.');
 
-  var res = sheet_('Results', H_RESULTS);
+  // A student in a real class goes to that class's own Sheet; anything else lands in this Sheet.
+  var cls = knownClass_(d['class']);
+  var tss = cls ? classSs_(cls) : ss_();
+
+  var res = sheet_('Results', H_RESULTS, false, tss);
   var n = res.getLastRow();
   var ids = n > 1 ? res.getRange(2, 12, n - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
   if (ids.indexOf(id) !== -1) return { ok: true, duplicate: true };
@@ -174,7 +222,7 @@ function saveResult_(d) {
   var integ = d.integrity || {};
   var flags = integ.flagged ? cap_(integ.summary, 500) : '';
   var quiz = safe_(cap_(d.quiz, 100));
-  res.appendRow([ts, name, safe_(cap_(d['class'], 60)), quiz, num_(d.score), num_(d.total), num_(d.percent),
+  res.appendRow([ts, name, safe_(cls || cap_(d['class'], 60)), quiz, num_(d.score), num_(d.total), num_(d.percent),
     d.late ? 'LATE' : '', safe_(flags), num_(d.seconds), cap_(d.hwId, 40), id]);
   var r = res.getLastRow();
   if (flags) res.getRange(r, 1, 1, H_RESULTS.length).setBackground('#fde2e2');
@@ -183,12 +231,12 @@ function saveResult_(d) {
   var rows = (d.answers || []).slice(0, 300).map(function (a) {
     return [id, name, quiz, num_(a.n), safe_(cap_(a.q, 500)), safe_(cap_(a.chosen, 300)), safe_(cap_(a.correctAnswer, 300)), a.ok ? 'YES' : 'NO', num_(a.earned)];
   });
-  append_(sheet_('Answers', H_ANSWERS), rows);
+  append_(sheet_('Answers', H_ANSWERS, false, tss), rows);
 
   var log = (d.log || []).slice(0, 300).map(function (l) {
     return [id, name, quiz, num_(l.t), safe_(cap_(l.type, 60)), safe_(cap_(l.detail, 200))];
   });
-  append_(sheet_('Activity log', H_LOG), log);
+  append_(sheet_('Activity log', H_LOG, false, tss), log);
   return { ok: true };
 }
 
@@ -209,7 +257,9 @@ function addClass_(name) {
     if (list[i].toLowerCase() === name.toLowerCase()) throw new Error('That class already exists.');
   }
   sheet_('Classes', H_CLASSES, true).appendRow([name, new Date().toISOString()]);
-  return { ok: true, classes: classNames_() };
+  var url = '';
+  try { url = classSs_(name).getUrl(); } catch (err) { /* it will be created when the first result arrives */ }
+  return { ok: true, classes: classNames_(), sheetUrl: url };
 }
 
 function deleteClass_(name) {
@@ -293,37 +343,59 @@ function getQuiz_(id) {
 }
 
 function adminList_() {
-  var res = sheet_('Results', H_RESULTS);
-  var n = res.getLastRow();
   var counts = {};
-  if (n > 1) {
+  var countIn = function (ss) {
+    var res = ss.getSheetByName('Results');
+    if (!res) return;
+    var n = res.getLastRow();
+    if (n < 2) return;
     res.getRange(2, 11, n - 1, 1).getValues().forEach(function (r) {
       var k = String(r[0]);
       if (k) counts[k] = (counts[k] || 0) + 1;
     });
-  }
+  };
+  countIn(ss_());   // results from before each class had its own Sheet
+  var names = classNames_(), links = {};
+  names.forEach(function (c) {
+    var cs = classSsIfAny_(c);
+    if (cs) { countIn(cs); links[c] = cs.getUrl(); }
+  });
   var hws = readHw_().reverse().map(function (h) { h.submissions = counts[h.id] || 0; return h; });
-  return { ok: true, sheetUrl: ss_().getUrl(), classes: classNames_(), homework: hws };
+  return { ok: true, sheetUrl: ss_().getUrl(), classSheets: links, classes: names, homework: hws };
 }
 
 // Latest submissions for one class (newest first), for the class page in the app.
+// Includes older results that were saved in this Sheet before the class had its own.
 function classResults_(name) {
-  var res = sheet_('Results', H_RESULTS);
-  var n = res.getLastRow();
-  var out = [];
-  if (n > 1) {
-    var vals = res.getRange(2, 1, n - 1, H_RESULTS.length).getValues();
-    for (var i = vals.length - 1; i >= 0 && out.length < 300; i--) {
-      var r = vals[i];
-      if (String(r[2]) !== String(name)) continue;
-      out.push({
-        ts: r[0] instanceof Date ? r[0].toISOString() : String(r[0]), name: String(r[1]), hw: String(r[3]),
-        score: Number(r[4]), total: Number(r[5]), percent: Number(r[6]), late: String(r[7]) === 'LATE',
-        flags: String(r[8]), seconds: Number(r[9]), hwId: String(r[10])
+  var cls = knownClass_(name);
+  var found = [];
+  var take = function (ss) {
+    var res = ss.getSheetByName('Results');
+    if (!res) return;
+    var n = res.getLastRow();
+    if (n < 2) return;
+    res.getRange(2, 1, n - 1, H_RESULTS.length).getValues().forEach(function (r) {
+      if (String(r[2]).toLowerCase() !== String(name).toLowerCase()) return;
+      var t = r[0] instanceof Date ? r[0] : new Date(r[0]);
+      found.push({
+        t: isNaN(t.getTime()) ? 0 : t.getTime(),
+        row: {
+          ts: isNaN(t.getTime()) ? String(r[0]) : t.toISOString(), name: String(r[1]), hw: String(r[3]),
+          score: Number(r[4]), total: Number(r[5]), percent: Number(r[6]), late: String(r[7]) === 'LATE',
+          flags: String(r[8]), seconds: Number(r[9]), hwId: String(r[10])
+        }
       });
-    }
+    });
+  };
+  var url = '';
+  if (cls) {
+    var cs = classSs_(cls);
+    url = cs.getUrl();
+    take(cs);
   }
-  return { ok: true, results: out };
+  take(ss_());
+  found.sort(function (a, b) { return b.t - a.t; });
+  return { ok: true, results: found.slice(0, 300).map(function (f) { return f.row; }), sheetUrl: url };
 }
 
 // Reads the question rows out of a Google Sheet in your Drive. The app turns them into questions.
@@ -337,14 +409,26 @@ function readSheet_(url) {
     throw new Error("Couldn't open that Google Sheet. Check the link, and that it is a real Google Sheet (an Excel file in Drive must first be opened and saved as a Google Sheet) owned by the same Google account as this script.");
   }
   var sheets = src.getSheets();
+  var rowsOf = function (sh) {
+    var rows = sh.getDataRange().getDisplayValues();
+    return rows.length > 1001 ? rows.slice(0, 1001) : rows;
+  };
+  var named = function (re) {
+    for (var i = 0; i < sheets.length; i++) { if (re.test(sheets[i].getName())) return sheets[i]; }
+    return null;
+  };
+  // A quiz can have two tabs: MULTI-CHOICE (Question, options, Answer, Points) and SHORT ANSWERS (Question, Answer, Points).
+  var mc = named(/multi|choice/i), sa = named(/short/i);
+  if (mc || sa) {
+    return { ok: true, title: src.getName(), tab: [mc, sa].filter(Boolean).map(function (x) { return x.getName(); }).join(' + '),
+      rows: mc ? rowsOf(mc) : [], shortRows: sa ? rowsOf(sa) : [], twoTab: true };
+  }
   var sh = sheets[0];
   var m = url.match(/[#&?]gid=(\d+)/);
   if (m) {
     sheets.forEach(function (s) { if (String(s.getSheetId()) === m[1]) sh = s; });
   }
-  var rows = sh.getDataRange().getDisplayValues();
-  if (rows.length > 1001) rows = rows.slice(0, 1001);
-  return { ok: true, title: src.getName(), tab: sh.getName(), rows: rows };
+  return { ok: true, title: src.getName(), tab: sh.getName(), rows: rowsOf(sh) };
 }
 
 function issue_(d) {
@@ -362,7 +446,7 @@ function issue_(d) {
       // typed answer: no options, one or more accepted answers
       bad = typeof q.q !== 'string' || !q.q.trim() || q.q.length > 2000 || !(Number(q.points) > 0) ||
         !q.answers || !q.answers.length || q.answers.length > 10 ||
-        q.answers.some(function (a) { return typeof a !== 'string' || !a.trim() || a.length > 200; });
+        q.answers.some(function (a) { return typeof a !== 'string' || !a.trim() || a.length > 300; });
     } else {
       bad = !q || typeof q.q !== 'string' || !q.q.trim() || q.q.length > 2000 ||
         !q.options || q.options.length < 2 || q.options.length > 8 ||

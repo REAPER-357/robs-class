@@ -1,6 +1,6 @@
 {
-  "name": "Rob's Class App",
-  "short_name": "Rob's Class",
+  "name": "Rob's Class",
+  "short_name": "Rob'sClass",
   "description": "Class quizzes with instant grading, deadlines and scores sent to Google Sheets.",
   "start_url": "./",
   "scope": "./",

@@ -1,4 +1,4 @@
-const CACHE = 'robs-class-app-v3';
+const CACHE = 'robs-class-v5';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon.png', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'logo.png'];
 const CDN = [
   'https://cdn.tailwindcss.com',
@@ -39,8 +39,8 @@ self.addEventListener('fetch', e => {
     e.respondWith(caches.match(req).then(hit => hit || fetch(req).then(store)));
     return;
   }
-  // your own files: network first so a new upload to GitHub shows up right away, cache when offline
+  // your own files: ask the server first (ignoring the browser's saved copy) so a new upload shows up right away; the cache is only for when offline
   e.respondWith(
-    fetch(req).then(store).catch(() => caches.match(req, { ignoreSearch: true }).then(hit => hit || caches.match('index.html')))
+    fetch(req, { cache: 'reload' }).then(store).catch(() => caches.match(req, { ignoreSearch: true }).then(hit => hit || caches.match('index.html')))
   );
 });

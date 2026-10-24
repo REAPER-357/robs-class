@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Rob's Class App</title>
+<title>Rob's Class</title>
 <meta name="description" content="Class quizzes with instant grading, deadlines and scores sent to Google Sheets.">
 <meta name="theme-color" content="#0b1020">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -17,22 +17,22 @@
      ============================================================ -->
 <script>
 const CONFIG = {
-  APP_NAME: "Rob's Class App",
+  APP_NAME: "Rob's Class",
 
   // Teacher password, stored as a hash (not readable). To change it:
   //   1. Open this app with  #hash  on the end of the address, e.g.  https://yoursite/#hash
   //   2. Type your new password, copy the hash it shows, paste it below.
   //   3. The Google script holds the password too: log in, then use the Copy button in the Teacher panel to get an updated script.
-  TEACHER_PASSWORD_HASH: 'dec0bd5639a5d26b2e7919543caf5cad17791abc42cb31775071b191b7108fd7',
-  HASH_SALT: 'robs-class-app',   // if you change these two, regenerate the hash
+  TEACHER_PASSWORD_HASH: 'aafc184862a8934512aaf362c131d56c7b0241c1398938d410d30cca09289451',
+  HASH_SALT: 'robs-class',
   HASH_ROUNDS: 20000,
 
   // Your Google web app URL (the one ending in /exec). Students' phones need it, so it must be in this file.
   // Easy way: Teacher panel > paste the URL > press "Copy line for index.html" > paste the line over this one.
-  WEBHOOK_URL: 'https://script.google.com/macros/s/AKfycbwJf1kvOJ5ZASMqEosS5yFyx7LLsWpcJ05Lz41DlPxIkb3vZH9aTkAXngO1CFlpnST91g/exec',
+  WEBHOOK_URL: 'https://script.google.com/macros/s/AKfycbzzDRM3LJprJmrBRrYBhv9euCEFhX8pNGPNzQKQDtC2wi_y1rYvJ5wS051o98toqgge/exec',
 
   // Big picture on the main page. Use 'icon.png' or 'logo.png' (or any file in the same folder).
-  HERO_IMAGE: 'logo.png',
+  HERO_IMAGE: 'icon.png',
   SHOW_TITLE_UNDER_IMAGE: true
 };
 </script>
@@ -115,6 +115,7 @@ applyTheme(getTheme());
   .optbox:hover { border-color: rgb(var(--faint)); }
   .noselect { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
   .noselect input { -webkit-user-select: text; user-select: text; }
+  body.cover #app { filter: blur(24px); }
   details > summary { list-style: none; } details > summary::-webkit-details-marker { display: none; }
   .swatch { width: 2.25rem; height: 2.25rem; border-radius: 999px; border: 2px solid transparent; cursor: pointer; }
   .swatch.on { outline: 2px solid rgb(var(--ink)); outline-offset: 2px; }
@@ -366,7 +367,7 @@ function parseRows(rows) {
       if (k < 0) { warnings.push(`Row ${d.n}: answer "${d.raw}" isn't one of ${choiceWords.join(' / ')}, skipped.`); return; }
       questions.push({ type: 'mc', q: d.text, options: choiceWords.slice(), answer: k, points: d.pts }); nAuto++;
     } else {
-      const answers = d.raw.split(/\s*[|;\n]\s*/).map(s => s.trim()).filter(s => normAns(s));
+      const answers = splitAlts(d.raw);
       if (!answers.length) { warnings.push(`Row ${d.n}: answer "${d.raw}" isn't usable, skipped.`); return; }
       questions.push({ type: 'text', q: d.text, options: [], answers, points: d.pts }); nText++; typedRows.push(d.n);
     }
@@ -382,13 +383,62 @@ function parseRows(rows) {
   return { questions, warnings, summary: parts.join(' · ') };
 }
 
+// Alternative accepted answers are separated with | (or a semicolon or new line)
+const splitAlts = raw => String(raw).split(/\s*[|;\n]\s*/).map(s => s.trim()).filter(s => normAns(s));
+
+// The SHORT ANSWERS tab: Question / Answer / Points. Every row is a question the student types the answer to.
+function parseShort(rows) {
+  const head = rows[0].map(h => String(h).trim().toLowerCase());
+  const qCol = head.findIndex(h => /^q(uestion)?s?\b/.test(h));
+  const aCol = head.findIndex(h => /^(correct|answer|key|ans)\b/.test(h));
+  const pCol = head.findIndex(h => /^(points?|marks?)\b/.test(h));
+  if (qCol < 0) throw new Error('Could not find a "Question" column in row 1.');
+  if (aCol < 0) throw new Error('Could not find an "Answer" column in row 1.');
+  const questions = [], warnings = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i], n = i + 1;
+    const text = String(r[qCol] ?? '').trim();
+    if (!text) continue;
+    const raw = String(r[aCol] ?? '').trim();
+    if (!raw) { warnings.push(`Row ${n}: no answer, skipped.`); continue; }
+    const answers = splitAlts(raw);
+    if (!answers.length) { warnings.push(`Row ${n}: answer "${raw}" isn't usable, skipped.`); continue; }
+    if (answers.length > 10) { warnings.push(`Row ${n}: more than 10 accepted answers, skipped.`); continue; }
+    if (answers.some(a => a.length > 300) || text.length > 2000) { warnings.push(`Row ${n}: the question or an answer is too long, skipped.`); continue; }
+    let pts = pCol >= 0 ? parseFloat(r[pCol]) : 1;
+    if (!(pts > 0)) pts = 1;
+    questions.push({ type: 'text', q: text, options: [], answers, points: pts });
+  }
+  return { questions, warnings };
+}
+
+// A quiz with two tabs: MULTI-CHOICE first, then SHORT ANSWERS. Either tab can be missing.
+function parseTwoTab(mcRows, shortRows) {
+  const questions = [], warnings = [], parts = [];
+  if (mcRows && mcRows.length >= 2) {
+    let r;
+    try { r = parseRows(mcRows); } catch (e) { throw new Error('MULTI-CHOICE tab: ' + e.message); }
+    questions.push(...r.questions); r.warnings.forEach(w => warnings.push('MULTI-CHOICE ' + w.replace(/^Row/, 'row')));
+    if (r.summary) parts.push(r.summary);
+  }
+  if (shortRows && shortRows.length >= 2) {
+    let r;
+    try { r = parseShort(shortRows); } catch (e) { throw new Error('SHORT ANSWERS tab: ' + e.message); }
+    questions.push(...r.questions); r.warnings.forEach(w => warnings.push('SHORT ANSWERS ' + w.replace(/^Row/, 'row')));
+    if (r.questions.length) parts.push(`${r.questions.length} short answer${r.questions.length > 1 ? 's' : ''}`);
+  }
+  return { questions, warnings, summary: parts.join(' · '), twoTab: true };
+}
+
 // is the student's answer g right for question q? (g is an option number for multiple choice, typed text otherwise)
 const isRight = (q, g) => g !== undefined && (q.type === 'text' ? q.answers.some(a => sameAnswer(g, a)) : g === q.answer);
 
 function parseWorkbook(buf) {
   const wb = XLSX.read(buf, { type: 'array' });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  return parseRows(XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }));
+  const rowsOf = n => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, defval: '' });
+  const mcName = wb.SheetNames.find(n => /multi|choice/i.test(n)), saName = wb.SheetNames.find(n => /short/i.test(n));
+  if (mcName || saName) return parseTwoTab(mcName ? rowsOf(mcName) : [], saName ? rowsOf(saName) : []);
+  return parseRows(rowsOf(wb.SheetNames[0]));
 }
 function downloadTemplate() {
   const aoa = [
@@ -450,12 +500,12 @@ function setStatus(state) {
 }
 
 /* ---------- Google Apps Script (paste into the Sheet) ---------- */
-const APPS_SCRIPT = String.raw`// Rob's Class App: Google Sheets backend (version 3)
+const APPS_SCRIPT = String.raw`// Rob's Class: Google Sheets backend (version 4)
 // Paste this whole script into Extensions > Apps Script (from inside the Google Sheet you want to use).
 
 // Same password you use for the Teacher button. The app's "Copy" button fills this in for you.
 var TEACHER_PASSWORD = 'YOUR_PASSWORD_HERE';
-var VERSION = 3;
+var VERSION = 4;
 
 var H_RESULTS = ['Timestamp', 'Name', 'Class', 'Homework', 'Score', 'Total', 'Percent', 'Late', 'Flags', 'Seconds', 'HW ID', 'ID'];
 var H_ANSWERS = ['ID', 'Name', 'Quiz', '#', 'Question', 'Student answer', 'Correct answer', 'Correct?', 'Points'];
@@ -465,12 +515,13 @@ var H_HW = ['ID', 'Title', 'Classes', 'Deadline', 'Allow late', 'Minutes', 'Shuf
 var H_Q = ['HW ID', '#', 'Question', 'Options', 'Answer', 'Points'];
 
 // Actions that change the Sheet. They run one at a time so two students submitting together can't collide.
-var WRITE_ACTIONS = { submit: 1, addClass: 1, deleteClass: 1, issue: 1, updateHw: 1, deleteHw: 1 };
+// (classResults is here because it makes the class's results Sheet the first time it is opened.)
+var WRITE_ACTIONS = { submit: 1, addClass: 1, deleteClass: 1, issue: 1, updateHw: 1, deleteHw: 1, classResults: 1 };
 
 // ---------- entry points ----------
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (!p.action) return ContentService.createTextOutput("Rob's Class App webhook is live (v" + VERSION + ")");
+  if (!p.action) return ContentService.createTextOutput("Rob's Class webhook is live (v" + VERSION + ")");
   try {
     if (p.action === 'ping') return json_({ ok: true, version: VERSION });
     if (p.action === 'classes') return json_({ ok: true, classes: publicClasses_() });
@@ -498,7 +549,6 @@ function doPost(e) {
         case 'adminPing': return json_({ ok: true, version: VERSION });
         case 'adminList': return json_(adminList_());
         case 'readSheet': return json_(readSheet_(d.url));
-        case 'classResults': return json_(classResults_(d.name));
       }
       return json_({ ok: false, error: 'Unknown action' });
     }
@@ -517,6 +567,7 @@ function doPost(e) {
         case 'issue': return json_(issue_(d));
         case 'updateHw': return json_(updateHw_(d));
         case 'deleteHw': return json_(deleteHw_(d.id));
+        case 'classResults': return json_(classResults_(d.name));
       }
     } finally {
       lock.releaseLock();
@@ -553,8 +604,8 @@ function ss_() {
 
 // Finds a tab (creating it with a header row if needed). If an older tab with the same name has
 // different columns, it is renamed "(old ...)" and a fresh one is made, so nothing is lost.
-function sheet_(name, headers, asText) {
-  var ss = ss_();
+function sheet_(name, headers, asText, target) {
+  var ss = target || ss_();
   var sh = ss.getSheetByName(name);
   if (sh && sh.getLastRow() > 0) {
     var cur = sh.getRange(1, 1, 1, headers.length).getValues()[0].join('|');
@@ -610,13 +661,60 @@ function checkPassword_(pw) {
   }
 }
 
+// ---------- one results Sheet per class ----------
+// Each class gets its own Google Sheet (made in your Drive the first time it is needed) holding
+// that class's Results, Answers and Activity log tabs. The link between a class and its Sheet is
+// kept in the script's own storage, so the Classes tab stays as it was.
+function props_() {
+  return PropertiesService.getScriptProperties();
+}
+
+function classKey_(name) {
+  return 'rs:' + String(name).toLowerCase();
+}
+
+// the class name as it is written in the Classes tab, or '' if there is no such class
+function knownClass_(name) {
+  var want = String(name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  var list = classNames_();
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].toLowerCase() === want) return list[i];
+  }
+  return '';
+}
+
+// the class's results Sheet if it already exists, otherwise null (never creates one)
+function classSsIfAny_(name) {
+  var id = props_().getProperty(classKey_(name));
+  if (!id) return null;
+  try { return SpreadsheetApp.openById(id); } catch (err) { return null; }
+}
+
+// the class's results Sheet, created if it does not exist yet
+function classSs_(name) {
+  var ss = classSsIfAny_(name);
+  if (ss) return ss;
+  ss = SpreadsheetApp.create("Rob's Class - " + name + ' - results');
+  props_().setProperty(classKey_(name), ss.getId());
+  var first = ss.getSheets()[0];
+  sheet_('Results', H_RESULTS, false, ss);
+  sheet_('Answers', H_ANSWERS, false, ss);
+  sheet_('Activity log', H_LOG, false, ss);
+  try { if (first && first.getName() !== 'Results') ss.deleteSheet(first); } catch (err) { /* the empty first tab can stay */ }
+  return ss;
+}
+
 // ---------- results from students ----------
 function saveResult_(d) {
   var name = safe_(cap_(d.name, 60).replace(/\s+/g, ' ').trim());
   var id = cap_(d.id, 40);
   if (!name || !id) throw new Error('Missing name or id.');
 
-  var res = sheet_('Results', H_RESULTS);
+  // A student in a real class goes to that class's own Sheet; anything else lands in this Sheet.
+  var cls = knownClass_(d['class']);
+  var tss = cls ? classSs_(cls) : ss_();
+
+  var res = sheet_('Results', H_RESULTS, false, tss);
   var n = res.getLastRow();
   var ids = n > 1 ? res.getRange(2, 12, n - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
   if (ids.indexOf(id) !== -1) return { ok: true, duplicate: true };
@@ -626,7 +724,7 @@ function saveResult_(d) {
   var integ = d.integrity || {};
   var flags = integ.flagged ? cap_(integ.summary, 500) : '';
   var quiz = safe_(cap_(d.quiz, 100));
-  res.appendRow([ts, name, safe_(cap_(d['class'], 60)), quiz, num_(d.score), num_(d.total), num_(d.percent),
+  res.appendRow([ts, name, safe_(cls || cap_(d['class'], 60)), quiz, num_(d.score), num_(d.total), num_(d.percent),
     d.late ? 'LATE' : '', safe_(flags), num_(d.seconds), cap_(d.hwId, 40), id]);
   var r = res.getLastRow();
   if (flags) res.getRange(r, 1, 1, H_RESULTS.length).setBackground('#fde2e2');
@@ -635,12 +733,12 @@ function saveResult_(d) {
   var rows = (d.answers || []).slice(0, 300).map(function (a) {
     return [id, name, quiz, num_(a.n), safe_(cap_(a.q, 500)), safe_(cap_(a.chosen, 300)), safe_(cap_(a.correctAnswer, 300)), a.ok ? 'YES' : 'NO', num_(a.earned)];
   });
-  append_(sheet_('Answers', H_ANSWERS), rows);
+  append_(sheet_('Answers', H_ANSWERS, false, tss), rows);
 
   var log = (d.log || []).slice(0, 300).map(function (l) {
     return [id, name, quiz, num_(l.t), safe_(cap_(l.type, 60)), safe_(cap_(l.detail, 200))];
   });
-  append_(sheet_('Activity log', H_LOG), log);
+  append_(sheet_('Activity log', H_LOG, false, tss), log);
   return { ok: true };
 }
 
@@ -661,7 +759,9 @@ function addClass_(name) {
     if (list[i].toLowerCase() === name.toLowerCase()) throw new Error('That class already exists.');
   }
   sheet_('Classes', H_CLASSES, true).appendRow([name, new Date().toISOString()]);
-  return { ok: true, classes: classNames_() };
+  var url = '';
+  try { url = classSs_(name).getUrl(); } catch (err) { /* it will be created when the first result arrives */ }
+  return { ok: true, classes: classNames_(), sheetUrl: url };
 }
 
 function deleteClass_(name) {
@@ -745,37 +845,59 @@ function getQuiz_(id) {
 }
 
 function adminList_() {
-  var res = sheet_('Results', H_RESULTS);
-  var n = res.getLastRow();
   var counts = {};
-  if (n > 1) {
+  var countIn = function (ss) {
+    var res = ss.getSheetByName('Results');
+    if (!res) return;
+    var n = res.getLastRow();
+    if (n < 2) return;
     res.getRange(2, 11, n - 1, 1).getValues().forEach(function (r) {
       var k = String(r[0]);
       if (k) counts[k] = (counts[k] || 0) + 1;
     });
-  }
+  };
+  countIn(ss_());   // results from before each class had its own Sheet
+  var names = classNames_(), links = {};
+  names.forEach(function (c) {
+    var cs = classSsIfAny_(c);
+    if (cs) { countIn(cs); links[c] = cs.getUrl(); }
+  });
   var hws = readHw_().reverse().map(function (h) { h.submissions = counts[h.id] || 0; return h; });
-  return { ok: true, sheetUrl: ss_().getUrl(), classes: classNames_(), homework: hws };
+  return { ok: true, sheetUrl: ss_().getUrl(), classSheets: links, classes: names, homework: hws };
 }
 
 // Latest submissions for one class (newest first), for the class page in the app.
+// Includes older results that were saved in this Sheet before the class had its own.
 function classResults_(name) {
-  var res = sheet_('Results', H_RESULTS);
-  var n = res.getLastRow();
-  var out = [];
-  if (n > 1) {
-    var vals = res.getRange(2, 1, n - 1, H_RESULTS.length).getValues();
-    for (var i = vals.length - 1; i >= 0 && out.length < 300; i--) {
-      var r = vals[i];
-      if (String(r[2]) !== String(name)) continue;
-      out.push({
-        ts: r[0] instanceof Date ? r[0].toISOString() : String(r[0]), name: String(r[1]), hw: String(r[3]),
-        score: Number(r[4]), total: Number(r[5]), percent: Number(r[6]), late: String(r[7]) === 'LATE',
-        flags: String(r[8]), seconds: Number(r[9]), hwId: String(r[10])
+  var cls = knownClass_(name);
+  var found = [];
+  var take = function (ss) {
+    var res = ss.getSheetByName('Results');
+    if (!res) return;
+    var n = res.getLastRow();
+    if (n < 2) return;
+    res.getRange(2, 1, n - 1, H_RESULTS.length).getValues().forEach(function (r) {
+      if (String(r[2]).toLowerCase() !== String(name).toLowerCase()) return;
+      var t = r[0] instanceof Date ? r[0] : new Date(r[0]);
+      found.push({
+        t: isNaN(t.getTime()) ? 0 : t.getTime(),
+        row: {
+          ts: isNaN(t.getTime()) ? String(r[0]) : t.toISOString(), name: String(r[1]), hw: String(r[3]),
+          score: Number(r[4]), total: Number(r[5]), percent: Number(r[6]), late: String(r[7]) === 'LATE',
+          flags: String(r[8]), seconds: Number(r[9]), hwId: String(r[10])
+        }
       });
-    }
+    });
+  };
+  var url = '';
+  if (cls) {
+    var cs = classSs_(cls);
+    url = cs.getUrl();
+    take(cs);
   }
-  return { ok: true, results: out };
+  take(ss_());
+  found.sort(function (a, b) { return b.t - a.t; });
+  return { ok: true, results: found.slice(0, 300).map(function (f) { return f.row; }), sheetUrl: url };
 }
 
 // Reads the question rows out of a Google Sheet in your Drive. The app turns them into questions.
@@ -789,14 +911,26 @@ function readSheet_(url) {
     throw new Error("Couldn't open that Google Sheet. Check the link, and that it is a real Google Sheet (an Excel file in Drive must first be opened and saved as a Google Sheet) owned by the same Google account as this script.");
   }
   var sheets = src.getSheets();
+  var rowsOf = function (sh) {
+    var rows = sh.getDataRange().getDisplayValues();
+    return rows.length > 1001 ? rows.slice(0, 1001) : rows;
+  };
+  var named = function (re) {
+    for (var i = 0; i < sheets.length; i++) { if (re.test(sheets[i].getName())) return sheets[i]; }
+    return null;
+  };
+  // A quiz can have two tabs: MULTI-CHOICE (Question, options, Answer, Points) and SHORT ANSWERS (Question, Answer, Points).
+  var mc = named(/multi|choice/i), sa = named(/short/i);
+  if (mc || sa) {
+    return { ok: true, title: src.getName(), tab: [mc, sa].filter(Boolean).map(function (x) { return x.getName(); }).join(' + '),
+      rows: mc ? rowsOf(mc) : [], shortRows: sa ? rowsOf(sa) : [], twoTab: true };
+  }
   var sh = sheets[0];
   var m = url.match(/[#&?]gid=(\d+)/);
   if (m) {
     sheets.forEach(function (s) { if (String(s.getSheetId()) === m[1]) sh = s; });
   }
-  var rows = sh.getDataRange().getDisplayValues();
-  if (rows.length > 1001) rows = rows.slice(0, 1001);
-  return { ok: true, title: src.getName(), tab: sh.getName(), rows: rows };
+  return { ok: true, title: src.getName(), tab: sh.getName(), rows: rowsOf(sh) };
 }
 
 function issue_(d) {
@@ -814,7 +948,7 @@ function issue_(d) {
       // typed answer: no options, one or more accepted answers
       bad = typeof q.q !== 'string' || !q.q.trim() || q.q.length > 2000 || !(Number(q.points) > 0) ||
         !q.answers || !q.answers.length || q.answers.length > 10 ||
-        q.answers.some(function (a) { return typeof a !== 'string' || !a.trim() || a.length > 200; });
+        q.answers.some(function (a) { return typeof a !== 'string' || !a.trim() || a.length > 300; });
     } else {
       bad = !q || typeof q.q !== 'string' || !q.q.trim() || q.q.length > 2000 ||
         !q.options || q.options.length < 2 || q.options.length > 8 ||
@@ -916,6 +1050,14 @@ function installGuards() {
   document.addEventListener('visibilitychange', () => document.hidden ? onLeave('tab hidden or app switched') : onReturn());
   window.addEventListener('blur', () => onLeave('window lost focus'));
   window.addEventListener('focus', onReturn);
+  // While the window is covered or in the background, blur the quiz (app-switcher previews, overlays, split screen)
+  const cover = on => document.body.classList.toggle('cover', !!on && tracking());
+  document.addEventListener('visibilitychange', () => cover(document.hidden));
+  window.addEventListener('blur', () => cover(true));
+  window.addEventListener('focus', () => cover(false));
+  // Closing the tab or pressing Back during a quiz asks first
+  window.addEventListener('beforeunload', e => { if (tracking()) { e.preventDefault(); e.returnValue = ''; return ''; } });
+  window.addEventListener('popstate', () => { if (tracking()) backAttempt(); });
   window.addEventListener('pagehide', () => { if (tracking()) { attempt.lastSeen = Date.now(); saveAttempt(); } });
   ['copy', 'cut'].forEach(t => document.addEventListener(t, e => { if (!tracking()) return; attempt.stats.copies++; ev(t, 'tried to ' + t + ' text'); if (attempt.hw && attempt.hw.blockCopy !== false) e.preventDefault(); }));
   document.addEventListener('paste', () => { if (!tracking()) return; attempt.stats.pastes++; ev('paste', 'pasted into the page'); });
@@ -924,10 +1066,27 @@ function installGuards() {
   document.addEventListener('keydown', e => {
     if (!tracking()) return;
     const k = (e.key || '').toLowerCase(), mod = e.ctrlKey || e.metaKey;
-    if (k === 'printscreen' || (mod && (k === 'p' || k === 's')) || (e.metaKey && e.shiftKey && ['3', '4', '5'].includes(k))) { attempt.stats.prints++; ev('shortcut', (mod ? 'Ctrl/Cmd+' : '') + (e.key || '')); }
+    if (k === 'printscreen' || (mod && (k === 'p' || k === 's')) || (e.metaKey && e.shiftKey && ['3', '4', '5', 's'].includes(k))) { attempt.stats.prints++; ev('shortcut', (mod ? 'Ctrl/Cmd+' : '') + (e.key || '')); }
   });
 }
 
+
+function guardBack() { if (!history.state || !history.state.quiz) history.pushState({ quiz: 1 }, ''); }
+function backAttempt() {
+  if (!tracking()) return;
+  if (confirm('Leave the quiz? The timer keeps running, and leaving is reported to your teacher.')) {
+    ev('exited to menu', 'back button'); attempt.lastSeen = Date.now(); saveAttempt(); attempt = null; view = 'home'; render();
+  } else history.pushState({ quiz: 1 }, '');
+}
+// the student's name faintly repeated over the quiz, so a leaked screenshot shows whose it is
+function syncWatermark() {
+  let el = document.getElementById('wm');
+  if (!tracking()) { if (el) el.remove(); document.body.classList.remove('cover'); return; }
+  if (!el) { el = document.createElement('div'); el.id = 'wm'; el.setAttribute('aria-hidden', 'true'); el.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;z-index:40;pointer-events:none;'; document.body.appendChild(el); }
+  const txt = (attempt.name + ' · ' + attempt.cls).slice(0, 34).replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c]));
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="380" height="220"><text x="20" y="120" transform="rotate(-24 190 110)" font-family="sans-serif" font-size="19" font-weight="700" fill="rgb(140,140,150)" fill-opacity="0.17">' + txt + '</text></svg>';
+  el.style.backgroundImage = 'url("data:image/svg+xml,' + encodeURIComponent(svg) + '")';
+}
 /* ---------- views ---------- */
 const ICON_GEAR = '<svg viewBox="0 0 24 24" class="w-[18px] h-[18px]" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 const ICON_CAP = '<svg viewBox="0 0 24 24" class="w-8 h-8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10 12 5 2 10l10 5 10-5z"/><path d="M6 12v5c3 2.5 9 2.5 12 0v-5"/></svg>';
@@ -1056,7 +1215,7 @@ function connectionCard() {
       <ol class="mt-3 list-decimal ml-5 space-y-1.5 text-sm text-mute">
         <li>Create a new Google Sheet. This is where your results will go. Keep it private.</li>
         <li>In <b class="text-ink">that Sheet</b>, open <b class="text-ink">Extensions → Apps Script</b>, delete the sample code, press <b class="text-ink">Copy</b> below and paste.</li>
-        <li>Press <b class="text-ink">Save</b>. Choose <b class="text-ink">setup</b> in the function menu and press <b class="text-ink">Run</b>. Google asks for permission (again if you used an older script): choose your account, <b class="text-ink">Advanced → Go to project → Allow</b>. The tabs <b class="text-ink">Results, Answers, Activity log, Classes, Homework, Questions</b> appear along the bottom of that Sheet. <b class="text-ink">Sheet1 stays empty</b>, that's normal.</li>
+        <li>Press <b class="text-ink">Save</b>. Choose <b class="text-ink">setup</b> in the function menu and press <b class="text-ink">Run</b>. Google asks for permission (again if you used an older script): choose your account, <b class="text-ink">Advanced → Go to project → Allow</b>. The tabs <b class="text-ink">Results, Answers, Activity log, Classes, Homework, Questions</b> appear along the bottom of that Sheet (<b class="text-ink">Sheet1 stays empty</b>, that's normal). Every class you add also gets its <b class="text-ink">own results Sheet</b>, made in your Google Drive and named after the class, so classes never get mixed up.</li>
         <li>Click <b class="text-ink">Deploy → New deployment → Web app</b>. Set <b class="text-ink">Execute as: Me</b> and <b class="text-ink">Who has access: Anyone</b>. Copy the <b class="text-ink">Web app URL</b> into the box above.</li>
         <li>Updating the script later: <b class="text-ink">Deploy → Manage deployments → ✏️ → Version: New version → Deploy</b>. The URL stays the same.</li>
         <li>An older version of this script? The old tabs are kept and renamed "(old …)" automatically.</li>
@@ -1080,12 +1239,13 @@ function teacherView() {
     else if (adminData) body = `
       <section class="card">
         <div class="flex items-center justify-between gap-3 flex-wrap"><h2 class="text-lg font-bold">Classes</h2>
-          ${adminData.sheetUrl ? `<a href="${esc(adminData.sheetUrl)}" target="_blank" rel="noopener" class="text-sm text-accent-text underline">Open results in Google Sheets ↗</a>` : ''}</div>
+          ${adminData.sheetUrl ? `<a href="${esc(adminData.sheetUrl)}" target="_blank" rel="noopener" class="text-sm text-accent-text underline">Open main Google Sheet ↗</a>` : ''}</div>
         <div class="mt-3 flex gap-2"><input id="newClass" data-cn="1" class="input" maxlength="40" placeholder="New class name, e.g. Grade 6A" value="${esc(newClassName)}"><button data-act="saveClass" class="btn btn-primary" style="white-space:nowrap">Add class</button></div>
         ${classes.length ? `<div class="mt-4 grid sm:grid-cols-2 gap-3">${classes.map(c => {
           const n = hws.filter(h => h.status === 'open' && h.classes.includes(c)).length;
           return `<div class="rounded-xl border border-line bg-sunk p-4 flex items-center justify-between gap-2">
             <button data-act="openClass" data-v="${esc(c)}" class="text-left flex-1 min-w-0"><div class="font-semibold truncate">${esc(c)}</div><div class="text-xs text-faint">${n} open homework</div></button>
+            ${adminData.classSheets && adminData.classSheets[c] ? `<a href="${esc(adminData.classSheets[c])}" target="_blank" rel="noopener" class="text-xs text-accent-text underline px-1 whitespace-nowrap" title="This class's results Sheet">Sheet ↗</a>` : ''}
             <button data-act="delClass" data-v="${esc(c)}" class="text-xs text-faint hover:text-bad px-2" aria-label="Delete class ${esc(c)}" title="Delete class">✕</button></div>`;
         }).join('')}</div>` : '<p class="text-sm text-faint mt-3">No classes yet. Add your first one above.</p>'}
       </section>
@@ -1115,14 +1275,15 @@ function classResultsHTML(name) {
 
 function classView() {
   const hws = (adminData ? adminData.homework : []).filter(h => h.classes.includes(classViewName));
-  const sheetUrl = adminData && adminData.sheetUrl;
+  const cr0 = classRes[classViewName];
+  const sheetUrl = (cr0 && cr0.sheetUrl) || (adminData && adminData.classSheets && adminData.classSheets[classViewName]) || '';
   return `<div class="max-w-3xl mx-auto space-y-5">
     <button data-act="backTeacher" class="text-sm text-accent-text underline">← All classes</button>
     <h1 class="text-3xl font-extrabold tracking-tight">${esc(classViewName)}</h1>
     <section class="card"><div class="flex items-center justify-between gap-3 flex-wrap"><h2 class="text-lg font-bold">Homework for this class</h2><button data-act="newHw" data-v="${esc(classViewName)}" class="btn btn-primary">+ Issue homework</button></div>
       <div class="mt-4 space-y-3">${hws.length ? hws.map(hwCard).join('') : '<p class="text-sm text-faint">Nothing issued to this class yet.</p>'}</div></section>
     <section class="card"><div class="flex items-center justify-between gap-3 flex-wrap"><h2 class="text-lg font-bold">Results</h2>
-      <div class="flex gap-2"><button data-act="reloadResults" class="btn btn-ghost">Refresh</button>${sheetUrl ? `<a href="${esc(sheetUrl)}" target="_blank" rel="noopener" class="btn btn-ghost">Every answer in Google Sheets ↗</a>` : ''}</div></div>
+      <div class="flex gap-2"><button data-act="reloadResults" class="btn btn-ghost">Refresh</button>${sheetUrl ? `<a href="${esc(sheetUrl)}" target="_blank" rel="noopener" class="btn btn-ghost">This class's Google Sheet ↗</a>` : ''}</div></div>
       <div class="mt-3">${classResultsHTML(classViewName)}</div></section></div>`;
 }
 
@@ -1148,7 +1309,7 @@ function composeView() {
       <h2 class="text-lg font-bold">1. Questions</h2>
       <div class="flex gap-2 mt-3">${tab('sheet', 'Google Sheet')}${tab('file', 'Upload Excel / CSV')}</div>
       ${d.mode === 'sheet' ? `
-        <p class="text-sm text-mute mt-3">Open your quiz in Google Sheets, copy the address from the browser bar and paste it here. The first row must be the headers: <b class="text-ink">Question, Option A…, Answer, Points</b>. In <b class="text-ink">Answer</b>, type the correct option as it appears: a word, a number, or True / False / Not Given (a letter such as B also works). For True / False / Not Given questions you can leave the options empty. For a question the student <b class="text-ink">types</b> (a number or word), leave the options empty and put the answer in Answer; separate alternative answers with <b class="text-ink">|</b>. It has to be a real Google Sheet. Need a starting point? <a href="quiz-template.xlsx" download class="underline text-accent-text">Download the template</a>, upload it to Google Drive, open it and choose <b class="text-ink">File → Save as Google Sheets</b>.</p>
+        <p class="text-sm text-mute mt-3">Open your quiz in Google Sheets, copy the address from the browser bar and paste it here. The first row must be the headers: <b class="text-ink">Question, Option A…, Answer, Points</b>. In <b class="text-ink">Answer</b>, type the correct option as it appears: a word, a number, or True / False / Not Given (a letter such as B also works). For True / False / Not Given questions you can leave the options empty. For a question the student <b class="text-ink">types</b> (a number or word), leave the options empty and put the answer in Answer; separate alternative answers with <b class="text-ink">|</b>. <b class="text-ink">Short answers on their own page:</b> give the file two tabs, <b class="text-ink">MULTI-CHOICE</b> first and <b class="text-ink">SHORT ANSWERS</b> second (columns Question, Answer, Points). Students do the multiple choice, then go on to the short answers. It has to be a real Google Sheet. Need a starting point? <a href="quiz-template.xlsx" download class="underline text-accent-text">Download the template</a>, upload it to Google Drive, open it and choose <b class="text-ink">File → Save as Google Sheets</b>.</p>
         <label class="label mt-3" for="dUrl">Google Sheet link</label>
         <input id="dUrl" data-d="url" class="input" inputmode="url" placeholder="https://docs.google.com/spreadsheets/d/…" value="${esc(d.url)}">
         <button data-act="loadSheet" class="btn btn-ghost mt-3" ${d.loading ? 'disabled' : ''}>${d.loading ? 'Loading…' : 'Load questions'}</button>`
@@ -1183,7 +1344,12 @@ function composeView() {
 /* ----- student: quiz + result ----- */
 function quizView() {
   const Q = attempt.quiz;
-  const cards = attempt.order.map(({ qi, o }, n) => {
+  const isT = qi => Q.questions[qi].type === 'text';
+  attempt.order = attempt.order.filter(x => !isT(x.qi)).concat(attempt.order.filter(x => isT(x.qi)));
+  const nMc = attempt.order.filter(x => !isT(x.qi)).length;
+  const twoParts = nMc > 0 && nMc < attempt.order.length;      // multiple choice on page 1, short answers on page 2
+  const part = twoParts ? Math.min(attempt.part || 0, 1) : 0;
+  const cards = attempt.order.map(({ qi, o }, n) => ({ qi, o, n })).filter(x => !twoParts || (part === 0) === !isT(x.qi)).map(({ qi, o, n }) => {
     const q = Q.questions[qi];
     return `<section class="card">
       <div class="flex gap-3">
@@ -1209,9 +1375,13 @@ function quizView() {
       </div></div>
     <div class="max-w-3xl mx-auto mt-6 space-y-5 ${attempt.hw.blockCopy ? 'noselect' : ''}">
       <h1 class="text-2xl font-extrabold tracking-tight">${esc(Q.title)}</h1>
-      ${Q.questions.some(q => q.type === 'text') ? `<p class="text-sm text-mute -mt-2">For typed answers, spelling counts but capital letters don't.</p>` : ''}
+      <p class="text-xs text-faint -mt-3">Your name is shown faintly over this quiz. Screenshots, copying and leaving the page are recorded and sent to your teacher.</p>
+      ${twoParts ? `<div class="text-sm font-bold text-accent-text -mb-2">Part ${part + 1} of 2 · ${part === 0 ? 'Multiple choice' : 'Short answers'}</div>` : ''}
+      ${(!twoParts || part === 1) && Q.questions.some(q => q.type === 'text') ? `<p class="text-sm text-mute -mt-2">For typed answers, spelling counts but capital letters don't.</p>` : ''}
       ${cards}
-      <button data-act="submit" class="btn btn-primary w-full" style="padding:1rem;font-size:1rem">Submit answers</button>
+      ${twoParts && part === 0 ? `<button data-act="nextPart" class="btn btn-primary w-full" style="padding:1rem;font-size:1rem">Next: short answers →</button>`
+        : twoParts ? `<div style="display:grid;grid-template-columns:1fr 2fr;gap:.75rem"><button data-act="prevPart" class="btn btn-ghost" style="padding:1rem">← Back</button><button data-act="submit" class="btn btn-primary" style="padding:1rem;font-size:1rem">Submit answers</button></div>`
+        : `<button data-act="submit" class="btn btn-primary w-full" style="padding:1rem;font-size:1rem">Submit answers</button>`}
     </div>`;
 }
 
@@ -1291,8 +1461,9 @@ async function startHw(id) {
 function startAttempt(name, cls, hw, questions) {
   const idx = questions.map((_, i) => i);
   if (hw.shuffleQ) shuffle(idx);
-  const order = idx.map(qi => { const o = questions[qi].options.map((_, i) => i); if (hw.shuffleO) shuffle(o); return { qi, o }; });
-  attempt = { name, cls, hw, quiz: { title: hw.title, questions }, order, answers: {}, startedAt: Date.now(), lastSeen: Date.now(), done: false, stats: newStats(), log: [] };
+  let order = idx.map(qi => { const o = questions[qi].options.map((_, i) => i); if (hw.shuffleO) shuffle(o); return { qi, o }; });
+  order = order.filter(x => questions[x.qi].type !== 'text').concat(order.filter(x => questions[x.qi].type === 'text'));
+  attempt = { part: 0, name, cls, hw, quiz: { title: hw.title, questions }, order, answers: {}, startedAt: Date.now(), lastSeen: Date.now(), done: false, stats: newStats(), log: [] };
   attempt.log.push({ t: 0, type: 'started', detail: navigator.userAgent.slice(0, 120) });
   saveAttempt(); leaveStart = null; view = 'quiz'; render();
 }
@@ -1397,7 +1568,7 @@ async function checkConn() {
 
 async function loadClassResults(name) {
   classRes[name] = { loading: true, rows: [], err: '' }; if (view === 'classView' && classViewName === name) render();
-  try { const j = await admin('classResults', { name }); classRes[name] = { loading: false, rows: j.results, err: '' }; }
+  try { const j = await admin('classResults', { name }); classRes[name] = { loading: false, rows: j.results, err: '', sheetUrl: j.sheetUrl || '' }; }
   catch (e) { classRes[name] = { loading: false, rows: [], err: friendlyErr(e) }; }
   if (view === 'classView' && classViewName === name) render();
 }
@@ -1410,7 +1581,7 @@ async function loadSheet() {
   d.loading = true; d.err = ''; render();
   try {
     const j = await admin('readSheet', { url: d.url.trim() });
-    const { questions, warnings, summary } = parseRows(j.rows);
+    const { questions, warnings, summary } = j.twoTab ? parseTwoTab(j.rows, j.shortRows) : parseRows(j.rows);
     if (!questions.length) throw new Error('No valid questions found. ' + (warnings[0] || ''));
     d.questions = questions; d.warnings = warnings; d.summary = summary; d.source = d.url.trim();
     d.sourceLabel = '"' + j.title + '"' + (j.tab ? ' (tab ' + j.tab + ')' : '');
@@ -1467,7 +1638,8 @@ function render() {
   if (view !== lastView) window.scrollTo(0, 0);
   lastView = view;
   if (aid) { const el = document.getElementById(aid); if (el) { el.focus(); if (apos !== null) { try { el.setSelectionRange(apos, apos); } catch {} } } }
-  if (view === 'quiz') { updateProgress(); startTimer(); startBeat(); }
+  if (view === 'quiz') { guardBack(); updateProgress(); startTimer(); startBeat(); }
+  syncWatermark();
   if (view === 'teacherLogin' && !aid) { const p = $('#pwIn'); if (p) p.focus(); }
 }
 
@@ -1475,7 +1647,7 @@ document.addEventListener('click', async e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
   const act = b.dataset.act, v = b.dataset.v;
   switch (act) {
-    case 'home': view = 'home'; render(); break;
+    case 'home': view = 'home'; render(); checkForUpdate(); break;
     case 'goStudent': view = 'studentStart'; render(); loadClasses(); break;
     case 'reloadClasses': loadClasses(); break;
     case 'startHw': startHw(v); break;
@@ -1493,6 +1665,7 @@ document.addEventListener('click', async e => {
       if (!confirm('Leave the quiz? The timer keeps running, and leaving is reported to your teacher.')) return;
       ev('exited to menu', ''); attempt.lastSeen = Date.now(); saveAttempt(); attempt = null; view = 'home'; render(); break;
     case 'submit': submitQuiz(false); break;
+    case 'nextPart': case 'prevPart': if (attempt) { attempt.part = act === 'nextPart' ? 1 : 0; ev('page', act === 'nextPart' ? 'went to short answers' : 'back to multiple choice'); saveAttempt(); render(); window.scrollTo(0, 0); } break;
     case 'template': downloadTemplate(); break;
     case 'reloadAdmin': refreshAdmin(); break;
     case 'checkConn': checkConn(); break;
@@ -1580,6 +1753,28 @@ document.addEventListener('keydown', e => {
 window.addEventListener('online', retryPending);
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; });
 
+/* ---------- always look for a newer version ---------- */
+// Every build has its own stamp. On opening the app (and when coming back to it) the page asks the server for
+// the latest index.html, ignoring anything saved on the phone, and reloads itself if the stamp has changed.
+// It never reloads in the middle of a quiz or while the teacher is working: it waits for the home screen.
+const APP_BUILD = '20261021-084541';
+let updateTold = false;
+const safeToReload = () => !(attempt && !attempt.done) && ['home', 'studentStart', 'teacherLogin'].includes(view);
+async function checkForUpdate() {
+  if (!location.protocol.startsWith('http') || navigator.onLine === false) return;
+  try {
+    const r = await fetch(location.pathname, { cache: 'reload' });
+    if (!r.ok) return;
+    const m = (await r.text()).match(/const APP_BUILD = '([^']+)'/);
+    if (!m || m[1] === APP_BUILD) return;
+    if (!safeToReload()) { if (!updateTold) { updateTold = true; toast('A new version is ready. It loads when you go back to the home screen.'); } return; }
+    try { if (sessionStorage.getItem('rca.updTried') === m[1]) return; sessionStorage.setItem('rca.updTried', m[1]); } catch {}   // never loop
+    try { (await caches.keys()).forEach(k => caches.delete(k)); } catch {}
+    try { (await navigator.serviceWorker.getRegistrations()).forEach(g => g.unregister()); } catch {}
+    location.reload();
+  } catch {}
+}
+
 /* ---------- boot ---------- */
 (function init() {
   installGuards();
@@ -1589,7 +1784,11 @@ window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferr
   LS.del('rca.quiz');
   render();
   retryPending();
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(reg => reg.update().catch(() => {})).catch(() => {});
+  }
+  checkForUpdate();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkForUpdate(); });
 })();
 </script>
 </body>
